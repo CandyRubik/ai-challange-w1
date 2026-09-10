@@ -19,6 +19,7 @@ from app.agents.agent import (
 from app.main import app, get_chat_session_service
 from app.schemas import ChatExperimentSettings
 from app.services.chat_sessions import ChatSessionService, SQLiteChatSessionRepository
+from app.services.token_benchmark import TokenBenchmarkService, benchmark_plan
 from app.token_usage import ModelResult, ModelTokenUsage
 
 
@@ -294,6 +295,36 @@ def test_chat_http_reports_structured_context_overflow(tmp_path: Path) -> None:
     assert response.json()["detail"]["code"] == "context_overflow"
     assert response.json()["detail"]["overflow_tokens"] > 0
     assert model.calls == []
+
+
+def test_benchmark_exposes_real_requests_growth_and_overflow() -> None:
+    model = FakeLanguageModel(["Короткий ответ", "Ответ 1", "Ответ 2", "Ответ 3"])
+
+    report = TokenBenchmarkService(model, WordCounter(), system_prompt="system").run()
+
+    short, long, overflow = report.scenarios
+    assert long.total_tokens > short.total_tokens
+    assert long.turns[0].token_usage is not None
+    assert long.turns[-1].token_usage is not None
+    assert (
+        long.turns[-1].token_usage.history_tokens
+        > long.turns[0].token_usage.history_tokens
+    )
+    assert overflow.status == "overflow"
+    assert overflow.overflow is not None
+    assert overflow.overflow.overflow_tokens > 0
+    assert overflow.turns[0].response is None
+    assert len(model.calls) == benchmark_plan().api_calls == 4
+
+
+def test_benchmark_plan_api_shows_prompts_before_paid_run() -> None:
+    response = TestClient(app).get("/api/benchmark/plan")
+
+    assert response.status_code == 200
+    assert response.json()["api_calls"] == 4
+    assert response.json()["scenarios"][0]["requests"][0].startswith(
+        "Коротко объясни"
+    )
 
 
 def test_clear_chat_database_removes_all_sessions(tmp_path: Path) -> None:

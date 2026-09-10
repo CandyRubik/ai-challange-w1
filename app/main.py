@@ -4,6 +4,7 @@ from functools import lru_cache
 import logging
 import os
 from pathlib import Path
+from threading import RLock
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,8 @@ from .schemas import (
     ChatSendResponse,
     ChatSession,
     ChatSessionSummary,
+    TokenBenchmarkPlan,
+    TokenBenchmarkReport,
 )
 from .services.chat_sessions import (
     ChatSessionNotFound,
@@ -34,6 +37,7 @@ from .services.chat_sessions import (
     SQLiteChatSessionRepository,
 )
 from .services.experiment_settings import ExperimentSettingsStore
+from .services.token_benchmark import TokenBenchmarkService, benchmark_plan
 from .tokenizer import DeepSeekTokenCounter, TokenizerSetupError
 
 
@@ -58,6 +62,8 @@ app.add_middleware(
 
 _experiment_settings = ExperimentSettingsStore()
 _token_counter = DeepSeekTokenCounter()
+_benchmark_lock = RLock()
+_latest_benchmark_report: TokenBenchmarkReport | None = None
 
 
 @lru_cache(maxsize=1)
@@ -99,6 +105,41 @@ def get_debug_settings() -> ChatExperimentSettings:
 @app.put("/api/debug/settings", response_model=ChatExperimentSettings)
 def update_debug_settings(settings: ChatExperimentSettings) -> ChatExperimentSettings:
     return _experiment_settings.replace(settings)
+
+
+@app.get("/api/benchmark/plan", response_model=TokenBenchmarkPlan)
+def get_benchmark_plan() -> TokenBenchmarkPlan:
+    return benchmark_plan()
+
+
+@app.post("/api/benchmark/run", response_model=TokenBenchmarkReport)
+def run_benchmark() -> TokenBenchmarkReport:
+    global _latest_benchmark_report
+    settings = _experiment_settings.get()
+    try:
+        with _benchmark_lock:
+            report = TokenBenchmarkService(
+                DeepSeekProvider(model=settings.model, thinking_enabled=False),
+                _token_counter,
+                system_prompt=settings.system_prompt,
+            ).run()
+            _latest_benchmark_report = report
+            return report
+    except (AgentInputError, TokenizerSetupError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    except LlmConfigurationError:
+        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан") from None
+    except (AgentOutputError, LlmRequestError):
+        logger.exception("Token benchmark failed")
+        raise HTTPException(status_code=502, detail="Benchmark завершился ошибкой") from None
+
+
+@app.get("/api/benchmark/latest", response_model=TokenBenchmarkReport)
+def get_latest_benchmark() -> TokenBenchmarkReport:
+    with _benchmark_lock:
+        if _latest_benchmark_report is None:
+            raise HTTPException(status_code=404, detail="Benchmark ещё не запускался")
+        return _latest_benchmark_report
 
 
 @app.post("/api/chat/sessions", response_model=ChatSession, status_code=201)

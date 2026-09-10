@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -71,6 +71,48 @@ class ChatSendResponse(StrictModel):
     user_message: ChatMessage
     assistant_message: ChatMessage
     token_usage: ChatTurnTokenUsage
+
+
+class TokenOverflow(StrictModel):
+    prompt_tokens: int
+    reserved_output_tokens: int
+    context_limit_tokens: int
+    overflow_tokens: int
+
+
+class TokenBenchmarkScenarioPlan(StrictModel):
+    id: Literal["short", "long", "overflow"]
+    title: str
+    description: str
+    requests: list[str]
+
+
+class TokenBenchmarkPlan(StrictModel):
+    api_calls: int
+    scenarios: list[TokenBenchmarkScenarioPlan]
+
+
+class TokenBenchmarkTurn(StrictModel):
+    turn: int
+    request: str
+    response: str | None = None
+    token_usage: ChatTurnTokenUsage | None = None
+
+
+class TokenBenchmarkScenarioResult(TokenBenchmarkScenarioPlan):
+    status: Literal["completed", "overflow"]
+    turns: list[TokenBenchmarkTurn]
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    estimated_cost_usd: float
+    overflow: TokenOverflow | None = None
+
+
+class TokenBenchmarkReport(StrictModel):
+    source: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    scenarios: list[TokenBenchmarkScenarioResult]
 
 
 class ChatExperimentSettings(StrictModel):
