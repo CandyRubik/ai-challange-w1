@@ -1,72 +1,72 @@
 from __future__ import annotations
 
 from functools import lru_cache
-import logging
 import os
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .agents.agent import Agent, AgentContextOverflow, AgentInputError, AgentOutputError
-from .providers.deepseek import DeepSeekProvider, LlmConfigurationError, LlmRequestError
+from .agents.agent import Agent, AgentInputError, AgentOutputError
+from .providers.deepseek import (
+    DeepSeekProvider,
+    LlmConfigurationError,
+    LlmRequestError,
+)
 from .schemas import (
+    ChatExperimentSettings,
     ChatSendRequest,
     ChatSendResponse,
     ChatSession,
     ChatSessionSummary,
-    ChatSettings,
-    TokenExperimentRequest,
-    TokenExperimentResponse,
 )
 from .services.chat_sessions import (
     ChatSessionNotFound,
     ChatSessionService,
-    DEFAULT_DB_PATH,
+    DEFAULT_CHAT_DB_PATH,
     SQLiteChatSessionRepository,
 )
-from .services.settings import SettingsStore
-from .services.token_experiments import HaystackGenerator, TokenExperimentService
-from .tokenizer import DeepSeekTokenCounter, TokenizerSetupError
+from .services.experiment_settings import ExperimentSettingsStore
 
 
-logger = logging.getLogger(__name__)
-app = FastAPI(title="Rubik Study Harness")
-settings_store = SettingsStore()
-token_counter = DeepSeekTokenCounter()
+def _allowed_origins() -> list[str]:
+    configured_origins = os.getenv("FRONTEND_ORIGINS")
+    if not configured_origins:
+        return ["http://localhost:3000", "http://127.0.0.1:3000"]
+    return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
+
+
+app = FastAPI(title="Rubik Study Harness API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins(),
+    allow_credentials=False,
+    allow_methods=["DELETE", "GET", "POST", "PUT"],
+    allow_headers=["Content-Type"],
+)
+
+_experiment_settings = ExperimentSettingsStore()
 
 
 @lru_cache(maxsize=1)
-def repository() -> SQLiteChatSessionRepository:
-    return SQLiteChatSessionRepository(os.getenv("CHAT_DB_PATH", str(DEFAULT_DB_PATH)))
+def get_chat_repository() -> SQLiteChatSessionRepository:
+    database_path = os.getenv("CHAT_DB_PATH") or str(DEFAULT_CHAT_DB_PATH)
+    return SQLiteChatSessionRepository(database_path)
 
 
-def build_agent() -> Agent:
-    settings = settings_store.get()
-    return Agent(
+def get_chat_session_service() -> ChatSessionService:
+    settings = _experiment_settings.get()
+    agent = Agent(
         DeepSeekProvider(
             model=settings.model,
             thinking_enabled=settings.thinking_enabled,
         ),
-        token_counter,
         system_prompt=settings.system_prompt,
         max_tokens=settings.max_tokens,
         context_enabled=settings.history_enabled,
-        context_limit_tokens=settings.context_limit_tokens,
-        overflow_strategy=settings.overflow_strategy,
     )
-
-
-def chat_service() -> ChatSessionService:
-    return ChatSessionService(repository(), build_agent())
-
-
-def experiment_service() -> TokenExperimentService:
-    return TokenExperimentService(
-        build_agent(),
-        HaystackGenerator(token_counter),
-        token_counter,
-    )
+    return ChatSessionService(get_chat_repository(), agent)
 
 
 @app.get("/api/health")
@@ -77,58 +77,42 @@ def health() -> dict[str, bool | str]:
     }
 
 
-@app.get("/api/settings", response_model=ChatSettings)
-def get_settings() -> ChatSettings:
-    return settings_store.get()
+@app.get("/api/debug/settings", response_model=ChatExperimentSettings)
+def get_debug_settings() -> ChatExperimentSettings:
+    return _experiment_settings.get()
 
 
-@app.put("/api/settings", response_model=ChatSettings)
-def update_settings(settings: ChatSettings) -> ChatSettings:
-    return settings_store.replace(settings)
-
-
-@app.post("/api/experiments/needle", response_model=TokenExperimentResponse)
-def run_experiment(
-    request: TokenExperimentRequest,
-    service: TokenExperimentService = Depends(experiment_service),
-) -> TokenExperimentResponse:
-    try:
-        return service.run(
-            target_tokens=request.target_tokens,
-            target_bytes=request.target_bytes,
-            needle_position=request.needle_position,
-        )
-    except TokenizerSetupError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from None
-    except LlmConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from None
-    except LlmRequestError:
-        logger.exception("DeepSeek experiment failed")
-        raise HTTPException(status_code=502, detail="Запрос к модели завершился ошибкой") from None
+@app.put("/api/debug/settings", response_model=ChatExperimentSettings)
+def update_debug_settings(settings: ChatExperimentSettings) -> ChatExperimentSettings:
+    return _experiment_settings.replace(settings)
 
 
 @app.post("/api/chat/sessions", response_model=ChatSession, status_code=201)
-def create_session(service: ChatSessionService = Depends(chat_service)) -> ChatSession:
+def create_chat_session(
+    service: ChatSessionService = Depends(get_chat_session_service),
+) -> ChatSession:
     return service.create()
 
 
 @app.get("/api/chat/sessions", response_model=list[ChatSessionSummary])
-def list_sessions(
-    service: ChatSessionService = Depends(chat_service),
+def list_chat_sessions(
+    service: ChatSessionService = Depends(get_chat_session_service),
 ) -> list[ChatSessionSummary]:
     return service.list()
 
 
 @app.delete("/api/chat/sessions", status_code=204)
-def clear_sessions(service: ChatSessionService = Depends(chat_service)) -> Response:
+def clear_chat_sessions(
+    service: ChatSessionService = Depends(get_chat_session_service),
+) -> Response:
     service.clear()
     return Response(status_code=204)
 
 
 @app.get("/api/chat/sessions/{session_id}", response_model=ChatSession)
-def get_session(
+def get_chat_session(
     session_id: str,
-    service: ChatSessionService = Depends(chat_service),
+    service: ChatSessionService = Depends(get_chat_session_service),
 ) -> ChatSession:
     try:
         return service.get(session_id)
@@ -140,36 +124,22 @@ def get_session(
     "/api/chat/sessions/{session_id}/messages",
     response_model=ChatSendResponse,
 )
-def send_message(
+def send_chat_message(
     session_id: str,
     request: ChatSendRequest,
-    service: ChatSessionService = Depends(chat_service),
+    service: ChatSessionService = Depends(get_chat_session_service),
 ) -> ChatSendResponse:
     try:
         return service.send(session_id, request.content)
     except ChatSessionNotFound:
         raise HTTPException(status_code=404, detail="Чат не найден") from None
-    except AgentContextOverflow as error:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": str(error),
-                "code": "context_overflow",
-                "prompt_tokens": error.prompt_tokens,
-                "reserved_output_tokens": error.reserved_output_tokens,
-                "context_limit_tokens": error.context_limit_tokens,
-                "overflow_tokens": error.overflow_tokens,
-            },
-        ) from None
-    except (AgentInputError, TokenizerSetupError) as error:
+    except AgentInputError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
-    except LlmConfigurationError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from None
     except (AgentOutputError, LlmRequestError):
-        logger.exception("Chat request failed")
         raise HTTPException(status_code=502, detail="Запрос к модели завершился ошибкой") from None
+    except LlmConfigurationError:
+        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан") from None
 
 
 STATIC_ROOT = Path(__file__).resolve().parents[1] / "static"
 app.mount("/", StaticFiles(directory=STATIC_ROOT, html=True), name="static")
-

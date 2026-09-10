@@ -1,96 +1,74 @@
 <!doctype html>
 <html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Rubik Study Harness</title>
-  <link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-  <main class="shell">
-    <aside class="sidebar">
-      <div class="brand"><span>◇</span> Rubik Study Harness</div>
-      <button id="new-session" class="primary" type="button">+ Новый чат</button>
-      <div id="sessions" class="sessions"></div>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Изолированный чат с учебным агентом" />
+    <title>Rubik Study Harness — чат</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="chat-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/"><span>◇</span> Rubik Study Harness</a>
+        <button id="new-session" class="primary" type="button">＋ Новый чат</button>
+        <nav id="sessions" aria-label="Сессии чата"></nav>
+        <button id="clear-database" class="danger" type="button">Очистить историю</button>
 
-      <details class="settings">
-        <summary>Настройки модели</summary>
-        <form id="settings-form">
-          <label>Модель<input name="model" required></label>
-          <label class="check"><input name="thinking_enabled" type="checkbox"> Thinking</label>
-          <label class="check"><input name="history_enabled" type="checkbox"> Передавать историю</label>
-          <label>Резерв ответа<input name="max_tokens" type="number" min="16" max="384000"></label>
-          <label>Лимит контекста<input name="context_limit_tokens" type="number" min="512" max="1000000"></label>
-          <label>При переполнении
-            <select name="overflow_strategy">
-              <option value="reject">Остановить</option>
-              <option value="trim">Удалять старые ходы</option>
-            </select>
-          </label>
-          <label>System prompt<textarea name="system_prompt" rows="4"></textarea></label>
-          <button class="primary" type="submit">Применить</button>
-        </form>
-      </details>
-      <button id="clear-sessions" class="danger" type="button">Очистить историю</button>
-    </aside>
-
-    <section class="workspace">
-      <header>
-        <div><p class="eyebrow">DAY 8 / TOKEN LAB</p><h1 id="title">Новый чат</h1></div>
-        <span id="status">Загрузка…</span>
-      </header>
-
-      <section class="dashboard">
-        <div class="dashboard-title">
-          <div><p class="eyebrow">ТОКЕНЫ</p><h2>Как растёт контекст</h2></div>
-          <span id="token-source">локальный tokenizer + точный API usage</span>
-        </div>
-        <div class="metrics">
-          <div><span>Текущий запрос</span><strong id="metric-current">0</strong></div>
-          <div><span>История</span><strong id="metric-history">0</strong></div>
-          <div><span>Вход модели</span><strong id="metric-prompt">0</strong></div>
-          <div><span>Ответ</span><strong id="metric-completion">0</strong></div>
-          <div><span>За сессию</span><strong id="metric-total">0</strong></div>
-          <div><span>Стоимость</span><strong id="metric-cost">$0.000000</strong></div>
-        </div>
-        <div class="meter"><i id="context-fill"></i></div>
-        <div id="context-caption" class="caption">Контекст ещё не использован</div>
-        <div id="turn-chart" class="turn-chart"></div>
-
-        <details class="lab" open>
-          <summary>🧪 Иголка в стоге сена</summary>
-          <form id="experiment-form">
-            <label>Размер документа
-              <select name="size">
-                <option value="tokens:10000">10K токенов — точный размер</option>
-                <option value="tokens:100000">100K токенов — точный размер</option>
-                <option value="tokens:500000">500K токенов — точный размер</option>
-                <option value="tokens:1050000">1.05M токенов — переполнение</option>
-                <option value="bytes:5242880">5 MiB — исходная идея</option>
-              </select>
+        <details class="debug-menu">
+          <summary>⚙ Настройки чата</summary>
+          <form id="settings-form">
+            <label>Модель
+              <input name="model" list="model-options" />
+              <datalist id="model-options">
+                <option value="deepseek-v4-flash"></option>
+                <option value="deepseek-v4-pro"></option>
+              </datalist>
             </label>
-            <label>Позиция факта
-              <select name="needle_position">
-                <option value="0.1">10% — начало</option>
-                <option value="0.5" selected>50% — середина</option>
-                <option value="0.9">90% — конец</option>
-              </select>
-            </label>
-            <button class="primary" type="submit">Запустить</button>
+            <label class="check"><input name="thinking_enabled" type="checkbox" /> Thinking</label>
+            <label class="check"><input name="history_enabled" type="checkbox" /> История сессии</label>
+            <label>Max tokens<input name="max_tokens" type="number" min="128" max="8000" /></label>
+            <label>System prompt<textarea name="system_prompt" rows="4" maxlength="4000"></textarea></label>
+            <div class="debug-actions">
+              <button class="primary" type="submit">Применить</button>
+              <button id="reset-settings" type="button">Сбросить</button>
+            </div>
           </form>
-          <p class="hint">При первом запуске скачивается официальный токенизатор DeepSeek. Документ не сохраняется в истории.</p>
-          <pre id="experiment-result">Выберите размер и запустите эксперимент.</pre>
         </details>
+        <p class="memory-note">История сохраняется и восстанавливается после перезапуска backend.</p>
+      </aside>
+
+      <section class="conversation" aria-labelledby="chat-title">
+        <header>
+          <div>
+            <p class="eyebrow">ISOLATED SESSION CHAT</p>
+            <h1 id="chat-title">Новый чат</h1>
+          </div>
+          <span id="status" role="status">Подключение…</span>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite">
+          <div class="empty">
+            <span>✦</span>
+            <h2>Чем помочь?</h2>
+            <p>Каждая сессия имеет собственную историю диалога.</p>
+          </div>
+        </div>
+
+        <form id="message-form">
+          <textarea
+            id="message-input"
+            rows="2"
+            maxlength="12000"
+            placeholder="Напишите сообщение…"
+            aria-label="Сообщение агенту"
+            required
+          ></textarea>
+          <button class="primary" type="submit">Отправить</button>
+        </form>
       </section>
-
-      <section id="messages" class="messages"></section>
-      <form id="message-form" class="composer">
-        <textarea id="message-input" rows="2" placeholder="Напишите сообщение…" required></textarea>
-        <button class="primary" type="submit">Отправить</button>
-      </form>
-    </section>
-  </main>
-  <script src="/app.js"></script>
-</body>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
 </html>
-
