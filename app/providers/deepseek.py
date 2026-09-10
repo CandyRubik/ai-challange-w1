@@ -38,6 +38,8 @@ class LlmStreamChunk:
     content: str = ""
     finish_reason: str | None = None
     status: str = ""
+    usage: ModelTokenUsage | None = None
+    model: str = ""
 
 
 class DeepSeekProvider:
@@ -105,6 +107,8 @@ class DeepSeekProvider:
             "stream": stream,
             "extra_body": {"thinking": {"type": thinking_type}},
         }
+        if stream:
+            request["stream_options"] = {"include_usage": True}
         if thinking_type == "enabled":
             request["reasoning_effort"] = DEFAULT_REASONING_EFFORT
         if response_format is not None:
@@ -166,27 +170,27 @@ class DeepSeekProvider:
 
     def _extract_result(self, response: Any) -> ModelResult:
         content, finish_reason = self._extract_content(response)
-        usage = self._read(response, "usage")
-        details = self._read(usage, "completion_tokens_details")
+        usage = self._extract_usage(self._read(response, "usage"))
         return ModelResult(
             content=content,
-            usage=ModelTokenUsage(
-                prompt_tokens=int(self._read(usage, "prompt_tokens", 0) or 0),
-                completion_tokens=int(
-                    self._read(usage, "completion_tokens", 0) or 0
-                ),
-                cache_hit_tokens=int(
-                    self._read(usage, "prompt_cache_hit_tokens", 0) or 0
-                ),
-                cache_miss_tokens=int(
-                    self._read(usage, "prompt_cache_miss_tokens", 0) or 0
-                ),
-                reasoning_tokens=int(
-                    self._read(details, "reasoning_tokens", 0) or 0
-                ),
-            ),
+            usage=usage,
             finish_reason=finish_reason,
             model=str(self._read(response, "model", self._model_name())),
+        )
+
+    @classmethod
+    def _extract_usage(cls, usage: Any) -> ModelTokenUsage:
+        details = cls._read(usage, "completion_tokens_details")
+        return ModelTokenUsage(
+            prompt_tokens=int(cls._read(usage, "prompt_tokens", 0) or 0),
+            completion_tokens=int(cls._read(usage, "completion_tokens", 0) or 0),
+            cache_hit_tokens=int(
+                cls._read(usage, "prompt_cache_hit_tokens", 0) or 0
+            ),
+            cache_miss_tokens=int(
+                cls._read(usage, "prompt_cache_miss_tokens", 0) or 0
+            ),
+            reasoning_tokens=int(cls._read(details, "reasoning_tokens", 0) or 0),
         )
 
     @staticmethod
@@ -197,15 +201,20 @@ class DeepSeekProvider:
 
     @classmethod
     def _extract_stream_chunk(cls, chunk: Any) -> LlmStreamChunk:
+        raw_usage = cls._read(chunk, "usage")
+        usage = cls._extract_usage(raw_usage) if raw_usage is not None else None
+        model = str(cls._read(chunk, "model", "") or "")
         choices = cls._read(chunk, "choices", []) or []
         if not choices:
-            return LlmStreamChunk()
+            return LlmStreamChunk(usage=usage, model=model)
 
         choice = choices[0]
         delta = cls._read(choice, "delta")
         if delta is None:
             return LlmStreamChunk(
                 finish_reason=cls._read(choice, "finish_reason"),
+                usage=usage,
+                model=model,
             )
 
         reasoning = cls._read(delta, "reasoning_content", "")
@@ -216,20 +225,20 @@ class DeepSeekProvider:
             reasoning=reasoning if isinstance(reasoning, str) else str(reasoning or ""),
             content=content if isinstance(content, str) else str(content or ""),
             finish_reason=cls._read(choice, "finish_reason"),
+            usage=usage,
+            model=model,
         )
 
-    def _stream_once(
+    def _stream_chat_once(
         self,
         *,
-        system_prompt: str,
-        user_prompt: str,
+        messages: Sequence[AgentMessage],
         response_format: dict[str, Any] | None = None,
         thinking_type: str,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Iterator[LlmStreamChunk]:
-        request = self._build_request(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
+        request = self._build_chat_request(
+            messages=messages,
             response_format=response_format,
             thinking_type=thinking_type,
             max_tokens=max_tokens,
@@ -256,6 +265,53 @@ class DeepSeekProvider:
         if not saw_content:
             raise LlmEmptyStreamError(finish_reason)
 
+    def _stream_once(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_format: dict[str, Any] | None = None,
+        thinking_type: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[LlmStreamChunk]:
+        yield from self._stream_chat_once(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format=response_format,
+            thinking_type=thinking_type,
+            max_tokens=max_tokens,
+        )
+
+    def generate_stream(
+        self,
+        *,
+        messages: Sequence[AgentMessage],
+        response_format: dict[str, Any] | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[LlmStreamChunk]:
+        thinking_type = "enabled" if self._thinking_enabled else "disabled"
+        try:
+            yield from self._stream_chat_once(
+                messages=messages,
+                response_format=response_format,
+                thinking_type=thinking_type,
+                max_tokens=max_tokens,
+            )
+        except LlmEmptyStreamError as error:
+            if thinking_type == "disabled" or error.finish_reason == "content_filter":
+                raise
+            yield LlmStreamChunk(
+                status="Финальный ответ не пришёл в thinking-режиме; повторяем без thinking…",
+            )
+            yield from self._stream_chat_once(
+                messages=messages,
+                response_format=response_format,
+                thinking_type="disabled",
+                max_tokens=max_tokens,
+            )
+
     def stream(
         self,
         *,
@@ -264,28 +320,15 @@ class DeepSeekProvider:
         response_format: dict[str, Any] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Iterator[LlmStreamChunk]:
-        try:
-            yield from self._stream_once(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response_format=response_format,
-                thinking_type="enabled",
-                max_tokens=max_tokens,
-            )
-        except LlmEmptyStreamError as error:
-            if error.finish_reason == "content_filter":
-                raise
-
-            yield LlmStreamChunk(
-                status="Финальный ответ не пришёл в thinking-режиме; повторяем без thinking…",
-            )
-            yield from self._stream_once(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response_format=response_format,
-                thinking_type="disabled",
-                max_tokens=max_tokens,
-            )
+        messages: list[AgentMessage] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        yield from self.generate_stream(
+            messages=messages,
+            response_format=response_format,
+            max_tokens=max_tokens,
+        )
 
     def complete(
         self,

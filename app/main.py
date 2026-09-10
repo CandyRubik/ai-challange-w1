@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import json
 import logging
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ from threading import RLock
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .agents.agent import (
@@ -112,26 +114,48 @@ def get_benchmark_plan() -> TokenBenchmarkPlan:
     return benchmark_plan()
 
 
-@app.post("/api/benchmark/run", response_model=TokenBenchmarkReport)
-def run_benchmark() -> TokenBenchmarkReport:
-    global _latest_benchmark_report
+@app.post("/api/benchmark/run")
+def run_benchmark() -> StreamingResponse:
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан")
+
     settings = _experiment_settings.get()
-    try:
-        with _benchmark_lock:
-            report = TokenBenchmarkService(
-                DeepSeekProvider(model=settings.model, thinking_enabled=False),
-                _token_counter,
-                system_prompt=settings.system_prompt,
-            ).run()
-            _latest_benchmark_report = report
-            return report
-    except (AgentInputError, TokenizerSetupError) as error:
-        raise HTTPException(status_code=422, detail=str(error)) from None
-    except LlmConfigurationError:
-        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан") from None
-    except (AgentOutputError, LlmRequestError):
-        logger.exception("Token benchmark failed")
-        raise HTTPException(status_code=502, detail="Benchmark завершился ошибкой") from None
+    service = TokenBenchmarkService(
+        DeepSeekProvider(model=settings.model, thinking_enabled=False),
+        _token_counter,
+        system_prompt=settings.system_prompt,
+    )
+
+    def event_lines():
+        global _latest_benchmark_report
+        try:
+            with _benchmark_lock:
+                for event in service.stream_events():
+                    if event["type"] == "benchmark_completed":
+                        _latest_benchmark_report = TokenBenchmarkReport.model_validate_json(
+                            json.dumps(event["report"], ensure_ascii=False)
+                        )
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+        except (AgentInputError, AgentOutputError, TokenizerSetupError) as error:
+            yield json.dumps(
+                {"type": "error", "message": str(error)},
+                ensure_ascii=False,
+            ) + "\n"
+        except (LlmConfigurationError, LlmRequestError):
+            logger.exception("Token benchmark failed")
+            yield json.dumps(
+                {"type": "error", "message": "Benchmark завершился ошибкой"},
+                ensure_ascii=False,
+            ) + "\n"
+
+    return StreamingResponse(
+        event_lines(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/benchmark/latest", response_model=TokenBenchmarkReport)

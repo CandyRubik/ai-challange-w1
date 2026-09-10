@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import re
 import sqlite3
@@ -9,6 +10,7 @@ import sqlite3
 from fastapi.testclient import TestClient
 import pytest
 
+import app.main as main_module
 from app.agents.agent import (
     Agent,
     AgentContextOverflow,
@@ -17,6 +19,7 @@ from app.agents.agent import (
     AgentOutputError,
 )
 from app.main import app, get_chat_session_service
+from app.providers.deepseek import LlmStreamChunk
 from app.schemas import ChatExperimentSettings
 from app.services.chat_sessions import ChatSessionService, SQLiteChatSessionRepository
 from app.services.token_benchmark import TokenBenchmarkService, benchmark_plan
@@ -53,6 +56,31 @@ class FakeLanguageModel:
                 cache_miss_tokens=prompt_tokens,
             ),
             finish_reason="stop",
+            model="deepseek-v4-flash",
+        )
+
+
+class FakeStreamingLanguageModel(FakeLanguageModel):
+    def generate_stream(
+        self,
+        *,
+        messages: Sequence[AgentMessage],
+        max_tokens: int = 2_000,
+    ):
+        self.calls.append((list(messages), max_tokens))
+        answer = self.answers.pop(0)
+        midpoint = max(1, len(answer) // 2)
+        yield LlmStreamChunk(
+            content=answer[:midpoint],
+            model="deepseek-v4-flash",
+        )
+        yield LlmStreamChunk(
+            content=answer[midpoint:],
+            finish_reason="stop",
+            usage=ModelTokenUsage(
+                prompt_tokens=WordCounter().count_messages(messages),
+                completion_tokens=WordCounter().count_text(answer),
+            ),
             model="deepseek-v4-flash",
         )
 
@@ -317,6 +345,29 @@ def test_benchmark_exposes_real_requests_growth_and_overflow() -> None:
     assert len(model.calls) == benchmark_plan().api_calls == 4
 
 
+def test_benchmark_streams_requests_deltas_usage_and_overflow() -> None:
+    model = FakeStreamingLanguageModel(
+        ["Короткий ответ", "Ответ 1", "Ответ 2", "Ответ 3"]
+    )
+
+    events = list(
+        TokenBenchmarkService(model, WordCounter(), system_prompt="system")
+        .stream_events()
+    )
+
+    event_types = [event["type"] for event in events]
+    assert event_types[0] == "benchmark_started"
+    assert event_types.count("turn_started") == 5
+    assert event_types.count("response_delta") == 8
+    assert event_types.count("turn_completed") == 4
+    assert event_types.count("overflow") == 1
+    assert event_types[-1] == "benchmark_completed"
+    report = events[-1]["report"]
+    assert report["scenarios"][1]["turns"][2]["response"] == "Ответ 3"
+    assert report["scenarios"][2]["status"] == "overflow"
+    assert len(model.calls) == 4
+
+
 def test_benchmark_plan_api_shows_prompts_before_paid_run() -> None:
     response = TestClient(app).get("/api/benchmark/plan")
 
@@ -325,6 +376,27 @@ def test_benchmark_plan_api_shows_prompts_before_paid_run() -> None:
     assert response.json()["scenarios"][0]["requests"][0].startswith(
         "Коротко объясни"
     )
+
+
+def test_benchmark_http_stream_finishes_and_saves_latest(monkeypatch) -> None:
+    model = FakeStreamingLanguageModel(
+        ["Короткий ответ", "Ответ 1", "Ответ 2", "Ответ 3"]
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(main_module, "DeepSeekProvider", lambda **_: model)
+    monkeypatch.setattr(main_module, "_token_counter", WordCounter())
+    monkeypatch.setattr(main_module, "_latest_benchmark_report", None)
+
+    client = TestClient(app)
+    response = client.post("/api/benchmark/run")
+    events = [json.loads(line) for line in response.text.splitlines()]
+    latest = client.get("/api/benchmark/latest")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    assert events[-1]["type"] == "benchmark_completed"
+    assert latest.status_code == 200
+    assert latest.json()["scenarios"][1]["turns"][2]["response"] == "Ответ 3"
 
 
 def test_clear_chat_database_removes_all_sessions(tmp_path: Path) -> None:

@@ -107,6 +107,16 @@ class AgentResult:
     metrics: AgentTokenMetrics
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedAgentRequest:
+    messages: list[AgentMessage]
+    current_message_tokens: int
+    history_tokens: int
+    sent_history_tokens: int
+    estimated_prompt_tokens: int
+    dropped_messages: int
+
+
 class Agent:
     """Execute one context + current message -> model -> response cycle."""
 
@@ -144,11 +154,11 @@ class Agent:
             for message in messages
         )
 
-    def respond(
+    def prepare(
         self,
         context: AgentContext,
         current_message: str,
-    ) -> AgentResult:
+    ) -> PreparedAgentRequest:
         conversation = self._input_policy.apply(context, current_message)
         current = conversation[-1]
         original_history = conversation[:-1]
@@ -184,20 +194,30 @@ class Agent:
                 history_tokens=history_tokens,
             )
 
-        model_result = self._model.generate(
+        return PreparedAgentRequest(
             messages=model_messages(),
-            max_tokens=self._max_tokens,
+            current_message_tokens=current_tokens,
+            history_tokens=history_tokens,
+            sent_history_tokens=self._history_tokens(sent_history),
+            estimated_prompt_tokens=estimated_prompt,
+            dropped_messages=dropped_messages,
         )
+
+    def complete(
+        self,
+        request: PreparedAgentRequest,
+        model_result: ModelResult,
+    ) -> AgentResult:
         answer = self._output_policy.apply(model_result.content)
         usage = model_result.usage
         return AgentResult(
             content=answer,
             metrics=AgentTokenMetrics(
-                current_message_tokens=current_tokens,
-                history_tokens=history_tokens,
-                sent_history_tokens=self._history_tokens(sent_history),
+                current_message_tokens=request.current_message_tokens,
+                history_tokens=request.history_tokens,
+                sent_history_tokens=request.sent_history_tokens,
                 system_prompt_tokens=self._counter.count_text(self._system_prompt),
-                estimated_prompt_tokens=estimated_prompt,
+                estimated_prompt_tokens=request.estimated_prompt_tokens,
                 prompt_tokens=usage.prompt_tokens,
                 completion_tokens=usage.completion_tokens,
                 cache_hit_tokens=usage.cache_hit_tokens,
@@ -206,9 +226,21 @@ class Agent:
                 total_tokens=usage.total_tokens,
                 context_limit_tokens=self._context_limit_tokens,
                 reserved_output_tokens=self._max_tokens,
-                dropped_messages=dropped_messages,
+                dropped_messages=request.dropped_messages,
                 finish_reason=model_result.finish_reason,
                 model=model_result.model,
                 estimated_cost_usd=estimate_cost_usd(usage, model_result.model),
             ),
         )
+
+    def respond(
+        self,
+        context: AgentContext,
+        current_message: str,
+    ) -> AgentResult:
+        request = self.prepare(context, current_message)
+        model_result = self._model.generate(
+            messages=request.messages,
+            max_tokens=self._max_tokens,
+        )
+        return self.complete(request, model_result)

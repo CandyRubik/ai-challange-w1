@@ -44,8 +44,11 @@ def stream_chunk(
     reasoning: str = "",
     content: str = "",
     finish_reason: str | None = None,
+    usage: SimpleNamespace | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        model="deepseek-v4-flash",
+        usage=usage,
         choices=[
             SimpleNamespace(
                 finish_reason=finish_reason,
@@ -162,6 +165,46 @@ def test_provider_streams_reasoning_and_content() -> None:
         "Итоговый ответ.",
     ]
     assert completions.requests[0]["stream"] is True
+    assert completions.requests[0]["stream_options"] == {"include_usage": True}
+
+
+def test_provider_streams_context_and_final_usage() -> None:
+    final_usage = SimpleNamespace(
+        prompt_tokens=42,
+        completion_tokens=7,
+        prompt_cache_hit_tokens=32,
+        prompt_cache_miss_tokens=10,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
+    )
+    completions = FakeCompletions(
+        iter(
+            [
+                stream_chunk(content="Часть "),
+                stream_chunk(content="ответа", finish_reason="stop", usage=final_usage),
+            ]
+        )
+    )
+    provider = DeepSeekProvider(
+        client=client(completions),  # type: ignore[arg-type]
+        thinking_enabled=False,
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "next"},
+    ]
+
+    chunks = list(provider.generate_stream(messages=messages, max_tokens=64))
+
+    assert "".join(chunk.content for chunk in chunks) == "Часть ответа"
+    assert chunks[-1].usage is not None
+    assert chunks[-1].usage.prompt_tokens == 42
+    assert chunks[-1].finish_reason == "stop"
+    assert completions.requests[0]["messages"] == messages
+    assert completions.requests[0]["extra_body"] == {
+        "thinking": {"type": "disabled"},
+    }
 
 
 def test_provider_retries_empty_stream_without_thinking() -> None:

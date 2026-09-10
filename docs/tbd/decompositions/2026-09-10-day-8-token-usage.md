@@ -10,7 +10,8 @@
 | # | PR title | Purpose (one sentence) | Strategy | Size budget | Depends on | Status |
 |---|----------|------------------------|----------|-------------|------------|--------|
 | 1 | Token-aware agent core | Считать request/history/response usage, сохранять метрики и блокировать переполнение до API. | naturally safe | ~830 lines | — | in-progress |
-| 2 | Token Lab UI and benchmark | Показать рост токенов в чате и вынести реальные short/long/overflow запросы на отдельную benchmark-страницу. | naturally safe | ~800 lines | 1 | planned |
+| 2 | Token Lab UI and benchmark | Показать рост токенов в чате и вынести реальные short/long/overflow запросы на отдельную benchmark-страницу. | naturally safe | ~839 lines | 1 | in-progress |
+| 3 | Live benchmark stream | Показывать отправку каждого запроса, фрагменты ответа и финальный API usage непосредственно во время DeepSeek-вызова. | naturally safe | ~785 lines | 2 | in-progress |
 
 ## Slice details
 
@@ -42,9 +43,27 @@
   проверяемую демонстрацию задания; разделение оставило бы скрытый endpoint или
   интерфейс без воспроизводимого сравнения.
 
+### Slice 3 — Live benchmark stream
+
+- **In scope:** streaming Chat Completions с финальным API usage; подготовка и
+  завершение agent-вызова вокруг потока; NDJSON-события backend → browser;
+  пошаговое обновление request/response; тесты потока; новая запись реального
+  браузерного запуска.
+- **Out of scope:** изменение сценариев и их prompt, обычный chat UI.
+- **Ships safely because:** заменяет только транспорт benchmark endpoint;
+  обычные чаты не затрагиваются, а последний завершённый отчёт остаётся
+  доступен через прежний read endpoint.
+- **Cleanup owed:** none.
+- **Budget justification:** provider, agent, endpoint и browser образуют одну
+  сквозную потоковую вертикаль; каждый промежуточный вариант либо теряет
+  фактический usage, либо по-прежнему показывает результат только в конце.
+
 ## Decision log
 
 - 2026-09-10: рабочий прототип достиг ~1.4K reviewable lines; до коммитов
   разделён на backend core и демонстрационный UI, оба ниже жёсткого лимита 1000.
 - 2026-09-10: по обратной связи сравнение вынесено из чата на отдельную страницу;
   локальные ответы заменены реальными DeepSeek-вызовами с видимыми prompt.
+- 2026-09-10: пользователь отклонил монтаж готовых состояний; real-time
+  transport и запись настоящего запуска выделены из разросшегося slice 2 в
+  отдельный slice 3.
