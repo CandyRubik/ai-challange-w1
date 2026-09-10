@@ -8,6 +8,7 @@ from typing import Any
 from openai import OpenAI
 
 from ..agents.agent import AgentMessage
+from ..token_usage import ModelResult, ModelTokenUsage
 
 
 class LlmConfigurationError(RuntimeError):
@@ -50,6 +51,9 @@ class DeepSeekProvider:
         self._client = client
         self._model = model
         self._thinking_enabled = thinking_enabled
+
+    def _model_name(self) -> str:
+        return self._model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
     def _get_client(self) -> OpenAI:
         if self._client is not None:
@@ -95,7 +99,7 @@ class DeepSeekProvider:
         stream: bool = False,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
-            "model": self._model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+            "model": self._model_name(),
             "messages": list(messages),
             "max_tokens": max_tokens,
             "stream": stream,
@@ -112,30 +116,34 @@ class DeepSeekProvider:
         *,
         messages: Sequence[AgentMessage],
         max_tokens: int = DEFAULT_MAX_TOKENS,
-    ) -> str:
+    ) -> ModelResult:
         thinking_type = "enabled" if self._thinking_enabled else "disabled"
         request = self._build_chat_request(
             messages=messages,
             thinking_type=thinking_type,
             max_tokens=max_tokens,
         )
-        response = self._request_completion(request)
-        content, finish_reason = self._extract_content(response)
-        if content:
-            return content
+        first_result = self._extract_result(self._request_completion(request))
+        if first_result.content:
+            return first_result
 
-        if thinking_type == "enabled" and finish_reason != "content_filter":
+        if thinking_type == "enabled" and first_result.finish_reason != "content_filter":
             fallback = self._build_chat_request(
                 messages=messages,
                 thinking_type="disabled",
                 max_tokens=max_tokens,
             )
-            content, finish_reason = self._extract_content(
-                self._request_completion(fallback),
-            )
-            if content:
-                return content
+            fallback_result = self._extract_result(self._request_completion(fallback))
+            if fallback_result.content:
+                return ModelResult(
+                    content=fallback_result.content,
+                    usage=first_result.usage + fallback_result.usage,
+                    finish_reason=fallback_result.finish_reason,
+                    model=fallback_result.model,
+                )
+            first_result = fallback_result
 
+        finish_reason = first_result.finish_reason
         reason = f" (finish_reason={finish_reason})" if finish_reason else ""
         raise LlmRequestError(f"DeepSeek вернул пустой ответ{reason}")
 
@@ -155,6 +163,31 @@ class DeepSeekProvider:
         choice = response.choices[0]
         content = (choice.message.content or "").strip()
         return content, getattr(choice, "finish_reason", None)
+
+    def _extract_result(self, response: Any) -> ModelResult:
+        content, finish_reason = self._extract_content(response)
+        usage = self._read(response, "usage")
+        details = self._read(usage, "completion_tokens_details")
+        return ModelResult(
+            content=content,
+            usage=ModelTokenUsage(
+                prompt_tokens=int(self._read(usage, "prompt_tokens", 0) or 0),
+                completion_tokens=int(
+                    self._read(usage, "completion_tokens", 0) or 0
+                ),
+                cache_hit_tokens=int(
+                    self._read(usage, "prompt_cache_hit_tokens", 0) or 0
+                ),
+                cache_miss_tokens=int(
+                    self._read(usage, "prompt_cache_miss_tokens", 0) or 0
+                ),
+                reasoning_tokens=int(
+                    self._read(details, "reasoning_tokens", 0) or 0
+                ),
+            ),
+            finish_reason=finish_reason,
+            model=str(self._read(response, "model", self._model_name())),
+        )
 
     @staticmethod
     def _read(value: Any, name: str, default: Any = None) -> Any:

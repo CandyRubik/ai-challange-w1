@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import logging
 import os
 from pathlib import Path
 
@@ -8,7 +9,12 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .agents.agent import Agent, AgentInputError, AgentOutputError
+from .agents.agent import (
+    Agent,
+    AgentContextOverflow,
+    AgentInputError,
+    AgentOutputError,
+)
 from .providers.deepseek import (
     DeepSeekProvider,
     LlmConfigurationError,
@@ -28,6 +34,10 @@ from .services.chat_sessions import (
     SQLiteChatSessionRepository,
 )
 from .services.experiment_settings import ExperimentSettingsStore
+from .tokenizer import DeepSeekTokenCounter, TokenizerSetupError
+
+
+logger = logging.getLogger(__name__)
 
 
 def _allowed_origins() -> list[str]:
@@ -47,6 +57,7 @@ app.add_middleware(
 )
 
 _experiment_settings = ExperimentSettingsStore()
+_token_counter = DeepSeekTokenCounter()
 
 
 @lru_cache(maxsize=1)
@@ -62,9 +73,12 @@ def get_chat_session_service() -> ChatSessionService:
             model=settings.model,
             thinking_enabled=settings.thinking_enabled,
         ),
+        _token_counter,
         system_prompt=settings.system_prompt,
         max_tokens=settings.max_tokens,
         context_enabled=settings.history_enabled,
+        context_limit_tokens=settings.context_limit_tokens,
+        overflow_strategy=settings.overflow_strategy,
     )
     return ChatSessionService(get_chat_repository(), agent)
 
@@ -133,9 +147,22 @@ def send_chat_message(
         return service.send(session_id, request.content)
     except ChatSessionNotFound:
         raise HTTPException(status_code=404, detail="Чат не найден") from None
-    except AgentInputError as error:
+    except AgentContextOverflow as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(error),
+                "code": "context_overflow",
+                "prompt_tokens": error.prompt_tokens,
+                "reserved_output_tokens": error.reserved_output_tokens,
+                "context_limit_tokens": error.context_limit_tokens,
+                "overflow_tokens": error.overflow_tokens,
+            },
+        ) from None
+    except (AgentInputError, TokenizerSetupError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     except (AgentOutputError, LlmRequestError):
+        logger.exception("Chat request failed")
         raise HTTPException(status_code=502, detail="Запрос к модели завершился ошибкой") from None
     except LlmConfigurationError:
         raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан") from None

@@ -22,6 +22,14 @@ class FakeCompletions:
 
 def completion(content: str, finish_reason: str = "stop") -> SimpleNamespace:
     return SimpleNamespace(
+        model="deepseek-v4-flash",
+        usage=SimpleNamespace(
+            prompt_tokens=120,
+            completion_tokens=12,
+            prompt_cache_hit_tokens=80,
+            prompt_cache_miss_tokens=40,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=5),
+        ),
         choices=[
             SimpleNamespace(
                 finish_reason=finish_reason,
@@ -58,7 +66,13 @@ def test_provider_uses_chat_defaults() -> None:
     completions = FakeCompletions(completion("Готово"))
     provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
 
-    assert provider.generate(messages=[{"role": "user", "content": "Вопрос"}]) == "Готово"
+    result = provider.generate(messages=[{"role": "user", "content": "Вопрос"}])
+
+    assert result.content == "Готово"
+    assert result.usage.prompt_tokens == 120
+    assert result.usage.completion_tokens == 12
+    assert result.usage.cache_hit_tokens == 80
+    assert result.usage.reasoning_tokens == 5
     assert completions.requests == [{
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": "Вопрос"}],
@@ -79,7 +93,7 @@ def test_provider_forwards_agent_context() -> None:
         {"role": "user", "content": "Продолжение"},
     ]
 
-    assert provider.generate(messages=messages) == "Новый ответ"
+    assert provider.generate(messages=messages).content == "Новый ответ"
     assert completions.requests[0]["messages"] == messages
 
 
@@ -107,7 +121,10 @@ def test_provider_retries_empty_response_without_thinking() -> None:
     )
     provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
 
-    assert provider.generate(messages=[{"role": "user", "content": "Вопрос"}]) == "Ответ после повтора"
+    result = provider.generate(messages=[{"role": "user", "content": "Вопрос"}])
+
+    assert result.content == "Ответ после повтора"
+    assert result.usage.prompt_tokens == 240
     assert len(completions.requests) == 2
     assert completions.requests[1]["extra_body"] == {
         "thinking": {"type": "disabled"},
