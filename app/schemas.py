@@ -78,6 +78,12 @@ class TokenOverflow(StrictModel):
     reserved_output_tokens: int
     context_limit_tokens: int
     overflow_tokens: int
+    request_sent_to_api: bool = False
+    request_chars: int = 0
+    request_sha256: str | None = None
+    provider_status_code: int | None = None
+    provider_error_code: str | None = None
+    provider_error_message: str | None = None
 
 
 class TokenBenchmarkScenarioPlan(StrictModel):
@@ -112,6 +118,8 @@ class TokenBenchmarkScenarioResult(TokenBenchmarkScenarioPlan):
 class TokenBenchmarkReport(StrictModel):
     source: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    api_calls_attempted: int = 0
+    api_calls_succeeded: int = 0
     scenarios: list[TokenBenchmarkScenarioResult]
 
 

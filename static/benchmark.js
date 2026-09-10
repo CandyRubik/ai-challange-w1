@@ -25,7 +25,7 @@ function requestBlock(scenarioId, request, index, overflow = false) {
   const block = document.createElement("article");
   block.id = `request-${scenarioId}-${index + 1}`;
   block.className = "benchmark-turn request";
-  const label = overflow ? "БУДЕТ ОТКЛОНЁН ДО API" : "ГОТОВ К ОТПРАВКЕ";
+  const label = overflow ? "ГОТОВ К РЕАЛЬНОМУ OVERFLOW-ВЫЗОВУ" : "ГОТОВ К ОТПРАВКЕ";
   block.innerHTML = `<header><span>REQUEST ${index + 1}</span><small>${label}</small></header>`;
   const text = document.createElement("pre");
   text.textContent = request;
@@ -99,6 +99,17 @@ function showScenarioResult(scenario) {
   card.querySelector(".scenario-mark").textContent = scenario.status === "overflow" ? "✕" : "✓";
   const metrics = card.querySelector("dl");
   metrics.hidden = false;
+  if (scenario.overflow) {
+    const items = metrics.querySelectorAll("div");
+    items[0].querySelector("dt").textContent = "Attempted input";
+    items[0].querySelector("dd").textContent = numberFormat.format(scenario.overflow.prompt_tokens);
+    items[1].querySelector("dt").textContent = "HTTP";
+    items[1].querySelector("dd").textContent = scenario.overflow.provider_status_code || "error";
+    items[2].querySelector("dt").textContent = "Billed tokens";
+    items[2].querySelector("dd").textContent = "0";
+    items[3].querySelector("dd").textContent = "$0.000000";
+    return;
+  }
   metrics.querySelector('[data-metric="prompt"]').textContent = numberFormat.format(scenario.prompt_tokens);
   metrics.querySelector('[data-metric="completion"]').textContent = numberFormat.format(scenario.completion_tokens);
   metrics.querySelector('[data-metric="total"]').textContent = numberFormat.format(scenario.total_tokens);
@@ -109,17 +120,22 @@ function showOverflow(event) {
   const card = $(`#scenario-${event.scenario_id}`);
   if (!card) return;
   const request = $(`#request-${event.scenario_id}-${event.turn}`);
-  request.querySelector("small").textContent = "ОТКЛОНЁН ДО API · СПИСАНИЯ НЕТ";
+  request.querySelector("small").textContent = "ОТПРАВЛЕН · DEEPSEEK ВЕРНУЛ ОШИБКУ";
   const value = event.overflow;
+  const response = responseBlock(event.scenario_id, event.turn);
+  response.classList.remove("receiving");
+  response.classList.add("provider-error");
+  response.querySelector("header span").textContent = "DEEPSEEK API ERROR";
+  response.querySelector("header small").textContent = `HTTP ${value.provider_status_code || "error"} · ${value.provider_error_code || "context overflow"}`;
+  response.querySelector("pre").textContent = value.provider_error_message || "DeepSeek отклонил запрос из-за переполнения контекста.";
   const message = document.createElement("p");
   message.className = "benchmark-overflow";
-  message.textContent = `${numberFormat.format(value.prompt_tokens)} input + ${numberFormat.format(value.reserved_output_tokens)} reserved output > ${numberFormat.format(value.context_limit_tokens)} limit. Превышение: ${numberFormat.format(value.overflow_tokens)}. Вызова API не было.`;
+  message.textContent = `API-вызов выполнен. Локальная оценка: ${numberFormat.format(value.prompt_tokens)} input + ${numberFormat.format(value.reserved_output_tokens)} output > ${numberFormat.format(value.context_limit_tokens)} limit. Payload: ${numberFormat.format(value.request_chars)} символов · SHA-256 ${value.request_sha256}. Usage отсутствует, списано $0.`;
   card.querySelector(".benchmark-turns").append(message);
 }
 
 function renderSummary(report) {
-  const completedTurns = report.scenarios.flatMap((scenario) => scenario.turns).filter((turn) => turn.token_usage);
-  $("#summary-calls").textContent = numberFormat.format(completedTurns.length);
+  $("#summary-calls").textContent = `${numberFormat.format(report.api_calls_attempted)} (${numberFormat.format(report.api_calls_succeeded)} ok)`;
   $("#summary-prompt").textContent = numberFormat.format(report.scenarios.reduce((sum, item) => sum + item.prompt_tokens, 0));
   $("#summary-completion").textContent = numberFormat.format(report.scenarios.reduce((sum, item) => sum + item.completion_tokens, 0));
   $("#summary-cost").textContent = `$${report.scenarios.reduce((sum, item) => sum + item.estimated_cost_usd, 0).toFixed(6)}`;
@@ -132,9 +148,9 @@ function handleEvent(event) {
   } else if (event.type === "turn_started") {
     const request = $(`#request-${event.scenario_id}-${event.turn}`);
     request.querySelector("small").textContent = event.scenario_id === "overflow"
-      ? "ПРОВЕРЯЕМ ЛИМИТ ЛОКАЛЬНО"
+      ? `ОТПРАВЛЕН В DEEPSEEK · ~${numberFormat.format(event.estimated_prompt_tokens)} TOKENS`
       : "ОТПРАВЛЕН В DEEPSEEK · ЖДЁМ ПОТОК";
-    if (event.scenario_id !== "overflow") responseBlock(event.scenario_id, event.turn);
+    responseBlock(event.scenario_id, event.turn);
   } else if (event.type === "response_delta") {
     const block = responseBlock(event.scenario_id, event.turn);
     const text = block.querySelector("pre");
@@ -221,7 +237,7 @@ function renderStoredReport(report) {
 async function loadPlan() {
   plan = await api("/api/benchmark/plan");
   renderPlan(plan);
-  callCount.textContent = `${plan.api_calls} реальных API-вызова · overflow без вызова`;
+  callCount.textContent = `${plan.api_calls} реальных API-вызовов · последний должен вернуть 400`;
   statusNode.textContent = "Проверьте тексты ниже и запустите live benchmark.";
   runButton.disabled = false;
 }
@@ -252,7 +268,7 @@ if (params.get("latest") === "1") {
   Promise.all([api("/api/benchmark/plan"), api("/api/benchmark/latest")])
     .then(([loadedPlan, report]) => {
       plan = loadedPlan;
-      callCount.textContent = `${plan.api_calls} реальных API-вызова · overflow без вызова`;
+      callCount.textContent = `${plan.api_calls} реальных API-вызовов · последний должен вернуть 400`;
       renderStoredReport(report);
       statusNode.textContent = "Последний завершённый live benchmark.";
       runButton.disabled = false;

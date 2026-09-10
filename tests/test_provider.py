@@ -145,6 +145,39 @@ def test_provider_does_not_retry_content_filtered_response() -> None:
     assert len(completions.requests) == 1
 
 
+def test_provider_preserves_context_overflow_details() -> None:
+    error = RuntimeError("bad request")
+    error.status_code = 400  # type: ignore[attr-defined]
+    error.body = {  # type: ignore[attr-defined]
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Maximum context length is 1000000 tokens",
+        }
+    }
+    provider = DeepSeekProvider(
+        client=client(FakeCompletions(error)),  # type: ignore[arg-type]
+        thinking_enabled=False,
+    )
+
+    with pytest.raises(LlmRequestError) as raised:
+        list(provider.generate_stream(messages=[{"role": "user", "content": "x"}]))
+
+    assert raised.value.status_code == 400
+    assert raised.value.provider_code == "invalid_request_error"
+    assert raised.value.is_context_overflow is True
+
+
+def test_unrelated_bad_request_is_not_treated_as_context_overflow() -> None:
+    error = LlmRequestError(
+        "bad request",
+        status_code=400,
+        provider_code="invalid_request_error",
+        provider_message="Invalid max_tokens value",
+    )
+
+    assert error.is_context_overflow is False
+
+
 def test_provider_streams_reasoning_and_content() -> None:
     completions = FakeCompletions(
         iter(

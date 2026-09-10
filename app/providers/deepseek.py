@@ -18,6 +18,33 @@ class LlmConfigurationError(RuntimeError):
 class LlmRequestError(RuntimeError):
     """The provider rejected or failed to complete a request."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        provider_message: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.provider_message = provider_message
+
+    @property
+    def is_context_overflow(self) -> bool:
+        details = f"{self.provider_code or ''} {self.provider_message or ''}".casefold()
+        describes_context_limit = (
+            "context length" in details
+            or "context window" in details
+            or "too many tokens" in details
+            or all(
+                marker in details
+                for marker in ("maximum", "tokens", "requested")
+            )
+        )
+        return self.status_code in {400, 413, 422} and describes_context_limit
+
 
 class LlmEmptyStreamError(LlmRequestError):
     """The provider finished a stream without a visible answer."""
@@ -157,7 +184,27 @@ class DeepSeekProvider:
         except LlmConfigurationError:
             raise
         except Exception as error:
-            raise LlmRequestError("Запрос к DeepSeek завершился ошибкой") from error
+            raise self._request_error(
+                error,
+                "Запрос к DeepSeek завершился ошибкой",
+            ) from error
+
+    @classmethod
+    def _request_error(cls, error: Exception, fallback: str) -> LlmRequestError:
+        body = getattr(error, "body", None)
+        details = body.get("error", body) if isinstance(body, dict) else {}
+        if not isinstance(details, dict):
+            details = {}
+        provider_message = details.get("message")
+        provider_code = details.get("code") or details.get("type")
+        return LlmRequestError(
+            fallback,
+            status_code=getattr(error, "status_code", None),
+            provider_code=str(provider_code) if provider_code is not None else None,
+            provider_message=(
+                str(provider_message) if provider_message is not None else None
+            ),
+        )
 
     @staticmethod
     def _extract_content(response: Any) -> tuple[str, str | None]:
@@ -260,7 +307,10 @@ class DeepSeekProvider:
         except LlmEmptyStreamError:
             raise
         except Exception as error:
-            raise LlmRequestError("Потоковый запрос к DeepSeek завершился ошибкой") from error
+            raise self._request_error(
+                error,
+                "Потоковый запрос к DeepSeek завершился ошибкой",
+            ) from error
 
         if not saw_content:
             raise LlmEmptyStreamError(finish_reason)

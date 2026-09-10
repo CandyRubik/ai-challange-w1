@@ -129,6 +129,8 @@ h2 { margin-top: 2px; font-size: 17px; }
 .benchmark-turn.request { border-color: #514887; }
 .benchmark-turn.response { border-color: #2c665c; background: #12231f; }
 .benchmark-turn.response.receiving { border-color: #4da994; }
+.benchmark-turn.response.provider-error { border-color: #8f4354; background: #2a1820; }
+.benchmark-turn.response.provider-error header span { color: #ff9fb2; }
 .benchmark-turn header { display: flex; justify-content: space-between; gap: 8px; padding: 7px 9px; border-bottom: 1px solid #2d3250; }
 .benchmark-turn header span { color: #b7aaff; font-size: 9px; font-weight: 850; letter-spacing: .1em; }
 .benchmark-turn.response header span { color: #65d8bd; }

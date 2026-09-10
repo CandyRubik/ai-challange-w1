@@ -12,6 +12,7 @@
 | 1 | Token-aware agent core | Считать request/history/response usage, сохранять метрики и блокировать переполнение до API. | naturally safe | ~830 lines | — | in-progress |
 | 2 | Token Lab UI and benchmark | Показать рост токенов в чате и вынести реальные short/long/overflow запросы на отдельную benchmark-страницу. | naturally safe | ~839 lines | 1 | in-progress |
 | 3 | Live benchmark stream | Показывать отправку каждого запроса, фрагменты ответа и финальный API usage непосредственно во время DeepSeek-вызова. | naturally safe | ~785 lines | 2 | in-progress |
+| 4 | Provider-side context overflow | Реально отправить oversized payload и показать исходную ошибку лимита, возвращённую DeepSeek. | naturally safe | ~475 lines | 3 | in-progress |
 
 ## Slice details
 
@@ -58,6 +59,20 @@
   сквозную потоковую вертикаль; каждый промежуточный вариант либо теряет
   фактический usage, либо по-прежнему показывает результат только в конце.
 
+### Slice 4 — Provider-side context overflow
+
+- **In scope:** генерация payload выше фактического окна DeepSeek; пятый
+  API-вызов с обходом локального guard только внутри benchmark; безопасное
+  извлечение provider status/code/message; отображение размера и SHA-256;
+  тесты и новая запись живого прогона.
+- **Out of scope:** изменение безопасного preflight guard обычного чата,
+  хранение многомегабайтного payload или повтор provider-side ошибки.
+- **Ships safely because:** oversized-вызов доступен только по явному запуску
+  отдельной benchmark-страницы; ожидаемой считается только подтверждённая
+  ошибка контекстного лимита, остальные ошибки не маскируются.
+- **Cleanup owed:** none.
+- **Size:** ~475 reviewable lines; документация и MP4 исключены из метрики.
+
 ## Decision log
 
 - 2026-09-10: рабочий прототип достиг ~1.4K reviewable lines; до коммитов
@@ -67,3 +82,6 @@
 - 2026-09-10: пользователь отклонил монтаж готовых состояний; real-time
   transport и запись настоящего запуска выделены из разросшегося slice 2 в
   отдельный slice 3.
+- 2026-09-10: локальная имитация overflow не удовлетворяла условию; реальный
+  provider-side отказ выделен в slice 4, чтобы live-срез не превысил жёсткий
+  лимит 1000 reviewable lines.

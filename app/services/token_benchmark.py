@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator
+from collections.abc import Generator, Iterator, Sequence
 from dataclasses import asdict
+import hashlib
 from typing import Any, Protocol
 
-from ..agents.agent import Agent, AgentContextOverflow, AgentMessage, LanguageModel
+from ..agents.agent import Agent, AgentMessage, LanguageModel
 from ..providers.deepseek import LlmRequestError, LlmStreamChunk
 from ..schemas import (
     ChatTurnTokenUsage,
@@ -18,11 +19,21 @@ from ..schemas import (
 from ..token_usage import ModelResult, ModelTokenUsage, TokenCounter
 
 
+MODEL_CONTEXT_LIMIT_TOKENS = 1_048_576
+OVERFLOW_MARGIN_TOKENS = 50_000
+OVERFLOW_MAX_TOKENS = 64
+OVERFLOW_PREFIX = (
+    "Это проверка реального переполнения контекстного окна. "
+    "Ответь одним словом: готово. Данные:"
+)
+OVERFLOW_FILLER = " x"
+
+
 class StreamingLanguageModel(LanguageModel, Protocol):
     def generate_stream(
         self,
         *,
-        messages: list[AgentMessage],
+        messages: Sequence[AgentMessage],
         max_tokens: int,
     ) -> Iterator[LlmStreamChunk]: ...
 
@@ -44,14 +55,17 @@ LONG_REQUESTS = [
 ]
 
 OVERFLOW_REQUESTS = [
-    "Проверь этот текст при маленьком контекстном окне: "
-    + "история диалога увеличивает вход модели и стоимость запроса; " * 80,
+    (
+        "Сгенерированный payload: инструкция + повторитель « x» до объёма "
+        "> 1 048 576 токенов. Перед отправкой страница покажет точный размер "
+        "и SHA-256 фактического текста."
+    ),
 ]
 
 
 def benchmark_plan() -> TokenBenchmarkPlan:
     return TokenBenchmarkPlan(
-        api_calls=len(SHORT_REQUESTS) + len(LONG_REQUESTS),
+        api_calls=len(SHORT_REQUESTS) + len(LONG_REQUESTS) + len(OVERFLOW_REQUESTS),
         scenarios=[
             TokenBenchmarkScenarioPlan(
                 id="short",
@@ -68,7 +82,9 @@ def benchmark_plan() -> TokenBenchmarkPlan:
             TokenBenchmarkScenarioPlan(
                 id="overflow",
                 title="Переполнение",
-                description="Локальная проверка блокирует запрос до DeepSeek API.",
+                description=(
+                    "Реальный API-вызов с payload больше контекста DeepSeek V4."
+                ),
                 requests=OVERFLOW_REQUESTS,
             ),
         ],
@@ -82,88 +98,34 @@ class TokenBenchmarkService:
         counter: TokenCounter,
         *,
         system_prompt: str,
+        model_context_limit_tokens: int = MODEL_CONTEXT_LIMIT_TOKENS,
+        overflow_margin_tokens: int = OVERFLOW_MARGIN_TOKENS,
     ) -> None:
         self._model = model
         self._counter = counter
         self._system_prompt = system_prompt
+        self._model_context_limit_tokens = model_context_limit_tokens
+        self._overflow_margin_tokens = overflow_margin_tokens
 
     @staticmethod
     def _usage(metrics, turn: int) -> ChatTurnTokenUsage:
         return ChatTurnTokenUsage(turn=turn, **asdict(metrics))
 
-    def _run(
-        self,
-        plan: TokenBenchmarkScenarioPlan,
-        *,
-        context_limit_tokens: int,
-        max_tokens: int,
-    ) -> TokenBenchmarkScenarioResult:
-        agent = Agent(
-            self._model,
-            self._counter,
-            system_prompt=self._system_prompt,
-            max_tokens=max_tokens,
-            context_limit_tokens=context_limit_tokens,
-            overflow_strategy="reject",
-        )
-        context: list[AgentMessage] = []
-        turns: list[TokenBenchmarkTurn] = []
-        overflow: TokenOverflow | None = None
-
-        for turn_number, request in enumerate(plan.requests, start=1):
-            try:
-                result = agent.respond(context, request)
-            except AgentContextOverflow as error:
-                overflow = TokenOverflow(
-                    prompt_tokens=error.prompt_tokens,
-                    reserved_output_tokens=error.reserved_output_tokens,
-                    context_limit_tokens=error.context_limit_tokens,
-                    overflow_tokens=error.overflow_tokens,
-                )
-                turns.append(TokenBenchmarkTurn(turn=turn_number, request=request))
-                break
-
-            usage = self._usage(result.metrics, turn_number)
-            turns.append(
-                TokenBenchmarkTurn(
-                    turn=turn_number,
-                    request=request,
-                    response=result.content,
-                    token_usage=usage,
-                )
-            )
-            context.extend(
-                [
-                    {"role": "user", "content": request},
-                    {"role": "assistant", "content": result.content},
-                ]
-            )
-
-        completed = [turn.token_usage for turn in turns if turn.token_usage]
-        return TokenBenchmarkScenarioResult(
-            **plan.model_dump(),
-            status="overflow" if overflow else "completed",
-            turns=turns,
-            prompt_tokens=sum(usage.prompt_tokens for usage in completed),
-            completion_tokens=sum(usage.completion_tokens for usage in completed),
-            total_tokens=sum(usage.total_tokens for usage in completed),
-            estimated_cost_usd=sum(
-                usage.estimated_cost_usd or 0.0 for usage in completed
-            ),
-            overflow=overflow,
-        )
-
-    def run(self) -> TokenBenchmarkReport:
-        plan = benchmark_plan()
-        short, long, overflow = plan.scenarios
-        return TokenBenchmarkReport(
-            source="DeepSeek API usage + официальный локальный tokenizer",
-            scenarios=[
-                self._run(short, context_limit_tokens=1_000_000, max_tokens=192),
-                self._run(long, context_limit_tokens=1_000_000, max_tokens=192),
-                self._run(overflow, context_limit_tokens=256, max_tokens=64),
-            ],
-        )
+    def _build_overflow_request(self) -> tuple[str, int]:
+        target = self._model_context_limit_tokens + self._overflow_margin_tokens
+        repetitions = target
+        request = OVERFLOW_PREFIX + OVERFLOW_FILLER * repetitions
+        messages: list[AgentMessage] = [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": request},
+        ]
+        prompt_tokens = self._counter.count_messages(messages)
+        while prompt_tokens <= self._model_context_limit_tokens:
+            repetitions += max(target - prompt_tokens, 1_024)
+            request = OVERFLOW_PREFIX + OVERFLOW_FILLER * repetitions
+            messages[-1] = {"role": "user", "content": request}
+            prompt_tokens = self._counter.count_messages(messages)
+        return request, prompt_tokens
 
     def _stream_scenario(
         self,
@@ -172,14 +134,6 @@ class TokenBenchmarkService:
         context_limit_tokens: int,
         max_tokens: int,
     ) -> Generator[dict[str, Any], None, TokenBenchmarkScenarioResult]:
-        agent = Agent(
-            self._model,
-            self._counter,
-            system_prompt=self._system_prompt,
-            max_tokens=max_tokens,
-            context_limit_tokens=context_limit_tokens,
-            overflow_strategy="reject",
-        )
         context: list[AgentMessage] = []
         turns: list[TokenBenchmarkTurn] = []
         overflow: TokenOverflow | None = None
@@ -187,27 +141,89 @@ class TokenBenchmarkService:
         if not callable(generate_stream):
             raise TypeError("Benchmark model must support generate_stream")
 
-        yield {
-            "type": "scenario_started",
-            "scenario_id": plan.id,
-        }
-        for turn_number, request_text in enumerate(plan.requests, start=1):
+        yield {"type": "scenario_started", "scenario_id": plan.id}
+        for turn_number, display_request in enumerate(plan.requests, start=1):
+            request_text = display_request
+            generated_prompt_tokens: int | None = None
+            if plan.id == "overflow":
+                request_text, generated_prompt_tokens = self._build_overflow_request()
+
+            request_sha256 = hashlib.sha256(request_text.encode()).hexdigest()
             yield {
                 "type": "turn_started",
                 "scenario_id": plan.id,
                 "turn": turn_number,
-                "request": request_text,
+                "request": display_request,
+                "request_chars": len(request_text),
+                "request_sha256": request_sha256,
+                "estimated_prompt_tokens": generated_prompt_tokens,
             }
-            try:
-                prepared = agent.prepare(context, request_text)
-            except AgentContextOverflow as error:
-                overflow = TokenOverflow(
-                    prompt_tokens=error.prompt_tokens,
-                    reserved_output_tokens=error.reserved_output_tokens,
-                    context_limit_tokens=error.context_limit_tokens,
-                    overflow_tokens=error.overflow_tokens,
+
+            agent_context_limit = context_limit_tokens
+            if generated_prompt_tokens is not None:
+                agent_context_limit = max(
+                    agent_context_limit,
+                    generated_prompt_tokens + max_tokens + 1,
                 )
-                turns.append(TokenBenchmarkTurn(turn=turn_number, request=request_text))
+            agent = Agent(
+                self._model,
+                self._counter,
+                system_prompt=self._system_prompt,
+                max_tokens=max_tokens,
+                context_limit_tokens=agent_context_limit,
+                overflow_strategy="reject",
+            )
+            prepared = agent.prepare(context, request_text)
+            content_parts: list[str] = []
+            usage: ModelTokenUsage | None = None
+            finish_reason: str | None = None
+            model = ""
+            try:
+                for chunk in generate_stream(
+                    messages=prepared.messages,
+                    max_tokens=max_tokens,
+                ):
+                    if chunk.status:
+                        yield {
+                            "type": "status",
+                            "scenario_id": plan.id,
+                            "turn": turn_number,
+                            "message": chunk.status,
+                        }
+                    if chunk.content:
+                        content_parts.append(chunk.content)
+                        yield {
+                            "type": "response_delta",
+                            "scenario_id": plan.id,
+                            "turn": turn_number,
+                            "delta": chunk.content,
+                        }
+                    usage = chunk.usage or usage
+                    finish_reason = chunk.finish_reason or finish_reason
+                    model = chunk.model or model
+            except LlmRequestError as error:
+                if plan.id != "overflow" or not error.is_context_overflow:
+                    raise
+                overflow = TokenOverflow(
+                    prompt_tokens=prepared.estimated_prompt_tokens,
+                    reserved_output_tokens=max_tokens,
+                    context_limit_tokens=self._model_context_limit_tokens,
+                    overflow_tokens=max(
+                        0,
+                        prepared.estimated_prompt_tokens
+                        + max_tokens
+                        - self._model_context_limit_tokens,
+                    ),
+                    request_sent_to_api=True,
+                    request_chars=len(request_text),
+                    request_sha256=request_sha256,
+                    provider_status_code=error.status_code,
+                    provider_error_code=error.provider_code,
+                    provider_error_message=error.provider_message,
+                )
+                turns.append(
+                    TokenBenchmarkTurn(turn=turn_number, request=display_request)
+                )
                 yield {
                     "type": "overflow",
                     "scenario_id": plan.id,
@@ -215,33 +231,6 @@ class TokenBenchmarkService:
                     "overflow": overflow.model_dump(),
                 }
                 break
-
-            content_parts: list[str] = []
-            usage: ModelTokenUsage | None = None
-            finish_reason: str | None = None
-            model = ""
-            for chunk in generate_stream(
-                messages=prepared.messages,
-                max_tokens=max_tokens,
-            ):
-                if chunk.status:
-                    yield {
-                        "type": "status",
-                        "scenario_id": plan.id,
-                        "turn": turn_number,
-                        "message": chunk.status,
-                    }
-                if chunk.content:
-                    content_parts.append(chunk.content)
-                    yield {
-                        "type": "response_delta",
-                        "scenario_id": plan.id,
-                        "turn": turn_number,
-                        "delta": chunk.content,
-                    }
-                usage = chunk.usage or usage
-                finish_reason = chunk.finish_reason or finish_reason
-                model = chunk.model or model
 
             if usage is None:
                 raise LlmRequestError("DeepSeek stream completed without token usage")
@@ -255,13 +244,14 @@ class TokenBenchmarkService:
                 ),
             )
             turn_usage = self._usage(result.metrics, turn_number)
-            turn = TokenBenchmarkTurn(
-                turn=turn_number,
-                request=request_text,
-                response=result.content,
-                token_usage=turn_usage,
+            turns.append(
+                TokenBenchmarkTurn(
+                    turn=turn_number,
+                    request=display_request,
+                    response=result.content,
+                    token_usage=turn_usage,
+                )
             )
-            turns.append(turn)
             context.extend(
                 [
                     {"role": "user", "content": request_text},
@@ -299,21 +289,38 @@ class TokenBenchmarkService:
         plan = benchmark_plan()
         yield {"type": "benchmark_started", "api_calls": plan.api_calls}
         scenarios: list[TokenBenchmarkScenarioResult] = []
-        limits = [(1_000_000, 192), (1_000_000, 192), (256, 64)]
-        for scenario_plan, (context_limit, max_tokens) in zip(
+        limits = [
+            (self._model_context_limit_tokens, 192),
+            (self._model_context_limit_tokens, 192),
+            (self._model_context_limit_tokens * 2, OVERFLOW_MAX_TOKENS),
+        ]
+        for scenario_plan, (agent_limit, max_tokens) in zip(
             plan.scenarios,
             limits,
             strict=True,
         ):
             scenario = yield from self._stream_scenario(
                 scenario_plan,
-                context_limit_tokens=context_limit,
+                context_limit_tokens=agent_limit,
                 max_tokens=max_tokens,
             )
             scenarios.append(scenario)
 
+        succeeded = sum(
+            1
+            for scenario in scenarios
+            for turn in scenario.turns
+            if turn.token_usage is not None
+        )
+        attempted = succeeded + sum(
+            1
+            for scenario in scenarios
+            if scenario.overflow and scenario.overflow.request_sent_to_api
+        )
         report = TokenBenchmarkReport(
             source="DeepSeek streaming API usage + официальный локальный tokenizer",
+            api_calls_attempted=attempted,
+            api_calls_succeeded=succeeded,
             scenarios=scenarios,
         )
         yield {

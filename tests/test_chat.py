@@ -19,7 +19,7 @@ from app.agents.agent import (
     AgentOutputError,
 )
 from app.main import app, get_chat_session_service
-from app.providers.deepseek import LlmStreamChunk
+from app.providers.deepseek import LlmRequestError, LlmStreamChunk
 from app.schemas import ChatExperimentSettings
 from app.services.chat_sessions import ChatSessionService, SQLiteChatSessionRepository
 from app.services.token_benchmark import TokenBenchmarkService, benchmark_plan
@@ -68,6 +68,13 @@ class FakeStreamingLanguageModel(FakeLanguageModel):
         max_tokens: int = 2_000,
     ):
         self.calls.append((list(messages), max_tokens))
+        if not self.answers:
+            raise LlmRequestError(
+                "DeepSeek rejected oversized context",
+                status_code=400,
+                provider_code="invalid_request_error",
+                provider_message="Maximum context length is 512 tokens",
+            )
         answer = self.answers.pop(0)
         midpoint = max(1, len(answer) // 2)
         yield LlmStreamChunk(
@@ -325,33 +332,19 @@ def test_chat_http_reports_structured_context_overflow(tmp_path: Path) -> None:
     assert model.calls == []
 
 
-def test_benchmark_exposes_real_requests_growth_and_overflow() -> None:
-    model = FakeLanguageModel(["Короткий ответ", "Ответ 1", "Ответ 2", "Ответ 3"])
-
-    report = TokenBenchmarkService(model, WordCounter(), system_prompt="system").run()
-
-    short, long, overflow = report.scenarios
-    assert long.total_tokens > short.total_tokens
-    assert long.turns[0].token_usage is not None
-    assert long.turns[-1].token_usage is not None
-    assert (
-        long.turns[-1].token_usage.history_tokens
-        > long.turns[0].token_usage.history_tokens
-    )
-    assert overflow.status == "overflow"
-    assert overflow.overflow is not None
-    assert overflow.overflow.overflow_tokens > 0
-    assert overflow.turns[0].response is None
-    assert len(model.calls) == benchmark_plan().api_calls == 4
-
-
 def test_benchmark_streams_requests_deltas_usage_and_overflow() -> None:
     model = FakeStreamingLanguageModel(
         ["Короткий ответ", "Ответ 1", "Ответ 2", "Ответ 3"]
     )
 
     events = list(
-        TokenBenchmarkService(model, WordCounter(), system_prompt="system")
+        TokenBenchmarkService(
+            model,
+            WordCounter(),
+            system_prompt="system",
+            model_context_limit_tokens=512,
+            overflow_margin_tokens=10,
+        )
         .stream_events()
     )
 
@@ -365,14 +358,20 @@ def test_benchmark_streams_requests_deltas_usage_and_overflow() -> None:
     report = events[-1]["report"]
     assert report["scenarios"][1]["turns"][2]["response"] == "Ответ 3"
     assert report["scenarios"][2]["status"] == "overflow"
-    assert len(model.calls) == 4
+    assert report["api_calls_attempted"] == 5
+    assert report["api_calls_succeeded"] == 4
+    overflow = report["scenarios"][2]["overflow"]
+    assert overflow["request_sent_to_api"] is True
+    assert overflow["provider_status_code"] == 400
+    assert overflow["prompt_tokens"] > 512
+    assert len(model.calls) == 5
 
 
 def test_benchmark_plan_api_shows_prompts_before_paid_run() -> None:
     response = TestClient(app).get("/api/benchmark/plan")
 
     assert response.status_code == 200
-    assert response.json()["api_calls"] == 4
+    assert response.json()["api_calls"] == 5
     assert response.json()["scenarios"][0]["requests"][0].startswith(
         "Коротко объясни"
     )
@@ -386,6 +385,18 @@ def test_benchmark_http_stream_finishes_and_saves_latest(monkeypatch) -> None:
     monkeypatch.setattr(main_module, "DeepSeekProvider", lambda **_: model)
     monkeypatch.setattr(main_module, "_token_counter", WordCounter())
     monkeypatch.setattr(main_module, "_latest_benchmark_report", None)
+    service_class = TokenBenchmarkService
+    monkeypatch.setattr(
+        main_module,
+        "TokenBenchmarkService",
+        lambda model, counter, *, system_prompt: service_class(
+            model,
+            counter,
+            system_prompt=system_prompt,
+            model_context_limit_tokens=512,
+            overflow_margin_tokens=10,
+        ),
+    )
 
     client = TestClient(app)
     response = client.post("/api/benchmark/run")
@@ -396,6 +407,7 @@ def test_benchmark_http_stream_finishes_and_saves_latest(monkeypatch) -> None:
     assert response.headers["content-type"].startswith("application/x-ndjson")
     assert events[-1]["type"] == "benchmark_completed"
     assert latest.status_code == 200
+    assert latest.json()["api_calls_attempted"] == 5
     assert latest.json()["scenarios"][1]["turns"][2]["response"] == "Ответ 3"
 
 
