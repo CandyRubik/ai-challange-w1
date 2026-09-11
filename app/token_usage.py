@@ -65,6 +65,13 @@ class AgentTokenMetrics:
     finish_reason: str | None
     model: str
     estimated_cost_usd: float | None
+    summary_prompt_tokens: int = 0
+    summary_completion_tokens: int = 0
+    summary_total_tokens: int = 0
+    summary_tokens: int = 0
+    summary_estimated_cost_usd: float | None = None
+    compressed_messages: int = 0
+    retained_messages: int = 0
 
 
 @dataclass(frozen=True, slots=True)

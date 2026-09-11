@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -20,6 +20,7 @@ class ChatSendRequest(StrictModel):
 
 class ChatMessage(StrictModel):
     id: str
+    position: int
     role: Literal["user", "assistant"]
     content: str
     created_at: datetime
@@ -30,6 +31,22 @@ class ChatSessionSummary(StrictModel):
     title: str
     created_at: datetime
     updated_at: datetime
+
+
+class ChatContextSummary(StrictModel):
+    content: str = ""
+    summarized_message_count: int = 0
+    summary_tokens: int = 0
+    updated_at: datetime | None = None
+
+
+class ChatContextCompaction(StrictModel):
+    id: str
+    summary: str
+    source_start_position: int
+    source_end_position: int
+    summarized_message_count: int
+    created_at: datetime
 
 
 class ChatTurnTokenUsage(StrictModel):
@@ -51,6 +68,13 @@ class ChatTurnTokenUsage(StrictModel):
     finish_reason: str | None = None
     model: str
     estimated_cost_usd: float | None = None
+    summary_prompt_tokens: int = 0
+    summary_completion_tokens: int = 0
+    summary_total_tokens: int = 0
+    summary_tokens: int = 0
+    summary_estimated_cost_usd: float | None = None
+    compressed_messages: int = 0
+    retained_messages: int = 0
 
 
 class ChatSessionTokenUsage(StrictModel):
@@ -59,10 +83,16 @@ class ChatSessionTokenUsage(StrictModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    summary_prompt_tokens: int = 0
+    summary_completion_tokens: int = 0
+    summary_total_tokens: int = 0
+    summary_estimated_cost_usd: float = 0.0
 
 
 class ChatSession(ChatSessionSummary):
     messages: list[ChatMessage]
+    compactions: list[ChatContextCompaction] = Field(default_factory=list)
+    context_summary: ChatContextSummary = Field(default_factory=ChatContextSummary)
     token_usage: ChatSessionTokenUsage = Field(default_factory=ChatSessionTokenUsage)
 
 
@@ -73,60 +103,11 @@ class ChatSendResponse(StrictModel):
     token_usage: ChatTurnTokenUsage
 
 
-class TokenOverflow(StrictModel):
-    prompt_tokens: int
-    reserved_output_tokens: int
-    context_limit_tokens: int
-    overflow_tokens: int
-    request_sent_to_api: bool = False
-    request_chars: int = 0
-    request_sha256: str | None = None
-    provider_status_code: int | None = None
-    provider_error_code: str | None = None
-    provider_error_message: str | None = None
-
-
-class TokenBenchmarkScenarioPlan(StrictModel):
-    id: Literal["short", "long", "overflow"]
-    title: str
-    description: str
-    requests: list[str]
-
-
-class TokenBenchmarkPlan(StrictModel):
-    api_calls: int
-    scenarios: list[TokenBenchmarkScenarioPlan]
-
-
-class TokenBenchmarkTurn(StrictModel):
-    turn: int
-    request: str
-    response: str | None = None
-    token_usage: ChatTurnTokenUsage | None = None
-
-
-class TokenBenchmarkScenarioResult(TokenBenchmarkScenarioPlan):
-    status: Literal["completed", "overflow"]
-    turns: list[TokenBenchmarkTurn]
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-    estimated_cost_usd: float
-    overflow: TokenOverflow | None = None
-
-
-class TokenBenchmarkReport(StrictModel):
-    source: str
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    api_calls_attempted: int = 0
-    api_calls_succeeded: int = 0
-    scenarios: list[TokenBenchmarkScenarioResult]
-
-
-class ChatExperimentSettings(StrictModel):
+class ChatSettings(StrictModel):
     model: Annotated[str, Field(min_length=1, max_length=100)] = "deepseek-v4-flash"
     thinking_enabled: bool = True
-    history_enabled: bool = True
+    summary_batch_messages: Annotated[int, Field(ge=2, le=100)] = 10
+    summary_max_tokens: Annotated[int, Field(ge=64, le=4_000)] = 500
     max_tokens: Annotated[int, Field(ge=16, le=384_000)] = 2_000
     context_limit_tokens: Annotated[int, Field(ge=256, le=1_000_000)] = 1_000_000
     overflow_strategy: Literal["reject", "trim"] = "reject"
@@ -136,11 +117,7 @@ class ChatExperimentSettings(StrictModel):
     )
 
     @model_validator(mode="after")
-    def output_reserve_must_fit_context(self) -> ChatExperimentSettings:
+    def output_reserve_must_fit_context(self) -> ChatSettings:
         if self.max_tokens >= self.context_limit_tokens:
             raise ValueError("Резерв ответа должен быть меньше лимита контекста")
         return self
-
-
-# Compatibility name retained for callers of the first harness version.
-ChatSettings = ChatExperimentSettings
