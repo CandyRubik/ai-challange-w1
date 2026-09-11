@@ -18,6 +18,11 @@ class ChatSendRequest(StrictModel):
     content: Annotated[str, Field(min_length=1, max_length=8_000_000)]
 
 
+class ChatSessionCreate(StrictModel):
+    strategy: Literal["sliding_window", "sticky_facts", "branching"] = "sliding_window"
+    window_size: Annotated[int, Field(ge=1, le=100)] = 6
+
+
 class ChatMessage(StrictModel):
     id: str
     position: int
@@ -31,21 +36,31 @@ class ChatSessionSummary(StrictModel):
     title: str
     created_at: datetime
     updated_at: datetime
+    strategy: Literal["sliding_window", "sticky_facts", "branching"] = "sliding_window"
+    window_size: int = 6
+    parent_session_id: str | None = None
+    checkpoint_id: str | None = None
+    branch_name: str = "main"
 
 
-class ChatContextSummary(StrictModel):
-    content: str = ""
-    summarized_message_count: int = 0
-    summary_tokens: int = 0
-    updated_at: datetime | None = None
+class ChatStrategyUpdate(StrictModel):
+    strategy: Literal["sliding_window", "sticky_facts", "branching"]
+    window_size: Annotated[int, Field(ge=1, le=100)] = 6
 
 
-class ChatContextCompaction(StrictModel):
+class ChatCheckpointCreate(StrictModel):
+    name: Annotated[str, Field(min_length=1, max_length=80)] = "Checkpoint"
+
+
+class ChatBranchCreate(StrictModel):
+    checkpoint_id: str
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+
+
+class ChatCheckpoint(StrictModel):
     id: str
-    summary: str
-    source_start_position: int
-    source_end_position: int
-    summarized_message_count: int
+    name: str
+    message_count: int
     created_at: datetime
 
 
@@ -68,13 +83,12 @@ class ChatTurnTokenUsage(StrictModel):
     finish_reason: str | None = None
     model: str
     estimated_cost_usd: float | None = None
-    summary_prompt_tokens: int = 0
-    summary_completion_tokens: int = 0
-    summary_total_tokens: int = 0
-    summary_tokens: int = 0
-    summary_estimated_cost_usd: float | None = None
-    compressed_messages: int = 0
     retained_messages: int = 0
+    memory_prompt_tokens: int = 0
+    memory_completion_tokens: int = 0
+    memory_total_tokens: int = 0
+    memory_tokens: int = 0
+    memory_estimated_cost_usd: float | None = None
 
 
 class ChatSessionTokenUsage(StrictModel):
@@ -83,16 +97,16 @@ class ChatSessionTokenUsage(StrictModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
-    summary_prompt_tokens: int = 0
-    summary_completion_tokens: int = 0
-    summary_total_tokens: int = 0
-    summary_estimated_cost_usd: float = 0.0
+    memory_prompt_tokens: int = 0
+    memory_completion_tokens: int = 0
+    memory_total_tokens: int = 0
+    memory_estimated_cost_usd: float = 0.0
 
 
 class ChatSession(ChatSessionSummary):
     messages: list[ChatMessage]
-    compactions: list[ChatContextCompaction] = Field(default_factory=list)
-    context_summary: ChatContextSummary = Field(default_factory=ChatContextSummary)
+    facts: dict[str, str] = Field(default_factory=dict)
+    checkpoints: list[ChatCheckpoint] = Field(default_factory=list)
     token_usage: ChatSessionTokenUsage = Field(default_factory=ChatSessionTokenUsage)
 
 
@@ -106,8 +120,7 @@ class ChatSendResponse(StrictModel):
 class ChatSettings(StrictModel):
     model: Annotated[str, Field(min_length=1, max_length=100)] = "deepseek-v4-flash"
     thinking_enabled: bool = True
-    summary_batch_messages: Annotated[int, Field(ge=2, le=100)] = 10
-    summary_max_tokens: Annotated[int, Field(ge=64, le=4_000)] = 500
+    facts_max_tokens: Annotated[int, Field(ge=64, le=4_000)] = 500
     max_tokens: Annotated[int, Field(ge=16, le=384_000)] = 2_000
     context_limit_tokens: Annotated[int, Field(ge=256, le=1_000_000)] = 1_000_000
     overflow_strategy: Literal["reject", "trim"] = "reject"

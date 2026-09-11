@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import uuid4
 
 from ..agents.agent import Agent, AgentMessage
 from ..schemas import (
-    ChatContextSummary,
-    ChatContextCompaction,
+    ChatCheckpoint,
     ChatMessage,
     ChatSendResponse,
     ChatSession,
@@ -21,8 +20,8 @@ from ..schemas import (
     ChatSessionTokenUsage,
     ChatTurnTokenUsage,
 )
-from ..token_usage import AgentTokenMetrics, TokenCounter
-from .context_compression import ConversationSummarizer, SummaryResult
+from ..token_usage import AgentTokenMetrics, MESSAGE_OVERHEAD_TOKENS, TokenCounter
+from .context_strategies import ContextStrategyName, FactsExtractor, strategy_for
 
 
 DEFAULT_CHAT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "chat.sqlite3"
@@ -30,6 +29,10 @@ DEFAULT_DB_PATH = DEFAULT_CHAT_DB_PATH
 
 
 class ChatSessionNotFound(LookupError):
+    pass
+
+
+class ChatCheckpointNotFound(LookupError):
     pass
 
 
@@ -43,19 +46,10 @@ class StoredMessage:
 
 
 @dataclass(frozen=True, slots=True)
-class StoredContextSummary:
-    content: str = ""
-    summarized_message_count: int = 0
-    updated_at: datetime | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class StoredContextCompaction:
+class StoredCheckpoint:
     id: str
-    summary: str
-    source_start_position: int
-    source_end_position: int
-    summarized_message_count: int
+    name: str
+    message_count: int
     created_at: datetime
 
 
@@ -65,34 +59,47 @@ class StoredSession:
     title: str
     created_at: datetime
     updated_at: datetime
+    strategy: ContextStrategyName = "sliding_window"
+    window_size: int = 6
+    parent_session_id: str | None = None
+    checkpoint_id: str | None = None
+    branch_name: str = "main"
     messages: tuple[StoredMessage, ...] = ()
     token_metrics: tuple[AgentTokenMetrics, ...] = ()
-    compactions: tuple[StoredContextCompaction, ...] = ()
-    context_summary: StoredContextSummary = StoredContextSummary()
+    facts: dict[str, str] | None = None
+    checkpoints: tuple[StoredCheckpoint, ...] = ()
 
 
 class ChatSessionRepository(Protocol):
-    def create(self) -> StoredSession: ...
-
+    def create(
+        self,
+        *,
+        strategy: ContextStrategyName = "sliding_window",
+        window_size: int = 6,
+    ) -> StoredSession: ...
     def list(self) -> list[StoredSession]: ...
-
     def get(self, session_id: str) -> StoredSession: ...
-
     def clear(self) -> None: ...
-
+    def update_strategy(
+        self,
+        session_id: str,
+        strategy: ContextStrategyName,
+        window_size: int,
+    ) -> StoredSession: ...
     def append_exchange(
         self,
         session_id: str,
         user_content: str,
         assistant_content: str,
         token_metrics: AgentTokenMetrics,
-        context_summary: StoredContextSummary | None = None,
-        compactions: Sequence[StoredContextCompaction] = (),
+        facts: dict[str, str] | None = None,
     ) -> StoredSession: ...
+    def create_checkpoint(self, session_id: str, name: str) -> StoredCheckpoint: ...
+    def fork(self, session_id: str, checkpoint_id: str, name: str) -> StoredSession: ...
 
 
 class SQLiteChatSessionRepository:
-    """Durable chat history isolated behind a repository boundary."""
+    """Durable history, structured facts and copy-on-checkpoint chat branches."""
 
     def __init__(self, database_path: str | Path = DEFAULT_CHAT_DB_PATH) -> None:
         self._database_path = Path(database_path)
@@ -117,6 +124,13 @@ class SQLiteChatSessionRepository:
         finally:
             connection.close()
 
+    @staticmethod
+    def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+        return {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
     def _initialize(self) -> None:
         with self._connection() as connection:
             connection.executescript(
@@ -127,7 +141,6 @@ class SQLiteChatSessionRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
@@ -137,61 +150,41 @@ class SQLiteChatSessionRepository:
                     created_at TEXT NOT NULL,
                     UNIQUE (session_id, position)
                 );
-
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_session
-                ON chat_messages(session_id, position);
-
+                    ON chat_messages(session_id, position);
                 CREATE TABLE IF NOT EXISTS chat_turn_usage (
                     session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
                     turn INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     PRIMARY KEY (session_id, turn)
                 );
-
-                CREATE TABLE IF NOT EXISTS chat_context_summaries (
-                    session_id TEXT PRIMARY KEY
-                        REFERENCES chat_sessions(id) ON DELETE CASCADE,
-                    content TEXT NOT NULL,
-                    summarized_message_count INTEGER NOT NULL,
+                CREATE TABLE IF NOT EXISTS chat_facts (
+                    session_id TEXT PRIMARY KEY REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                    payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-
-                CREATE TABLE IF NOT EXISTS chat_context_compactions (
+                CREATE TABLE IF NOT EXISTS chat_checkpoints (
                     id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL
-                        REFERENCES chat_sessions(id) ON DELETE CASCADE,
-                    summary TEXT NOT NULL,
-                    source_start_position INTEGER NOT NULL,
-                    source_end_position INTEGER NOT NULL,
-                    summarized_message_count INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE (session_id, summarized_message_count)
+                    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_chat_context_compactions_session
-                ON chat_context_compactions(session_id, source_end_position);
-
-                INSERT OR IGNORE INTO chat_context_compactions (
-                    id,
-                    session_id,
-                    summary,
-                    source_start_position,
-                    source_end_position,
-                    summarized_message_count,
-                    created_at
-                )
-                SELECT
-                    'legacy:' || session_id || ':' || summarized_message_count,
-                    session_id,
-                    content,
-                    0,
-                    summarized_message_count - 1,
-                    summarized_message_count,
-                    updated_at
-                FROM chat_context_summaries
-                WHERE summarized_message_count > 0;
-                """,
+                """
             )
+            columns = self._columns(connection, "chat_sessions")
+            additions = {
+                "strategy": "TEXT NOT NULL DEFAULT 'sliding_window'",
+                "window_size": "INTEGER NOT NULL DEFAULT 6",
+                "parent_session_id": "TEXT",
+                "checkpoint_id": "TEXT",
+                "branch_name": "TEXT NOT NULL DEFAULT 'main'",
+            }
+            for name, declaration in additions.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE chat_sessions ADD COLUMN {name} {declaration}"
+                    )
 
     @staticmethod
     def _timestamp(value: datetime) -> str:
@@ -207,118 +200,104 @@ class SQLiteChatSessionRepository:
         session_id: str,
     ) -> StoredSession:
         row = connection.execute(
-            "SELECT id, title, created_at, updated_at FROM chat_sessions WHERE id = ?",
+            """
+            SELECT id, title, created_at, updated_at, strategy, window_size,
+                   parent_session_id, checkpoint_id, branch_name
+            FROM chat_sessions WHERE id = ?
+            """,
             (session_id,),
         ).fetchone()
         if row is None:
             raise ChatSessionNotFound(session_id)
-
         message_rows = connection.execute(
-            """
-            SELECT id, position, role, content, created_at
-            FROM chat_messages
-            WHERE session_id = ?
-            ORDER BY position
-            """,
+            """SELECT id, position, role, content, created_at
+               FROM chat_messages WHERE session_id = ? ORDER BY position""",
             (session_id,),
         ).fetchall()
-        messages = tuple(
-            StoredMessage(
-                id=message["id"],
-                position=message["position"],
-                role=message["role"],
-                content=message["content"],
-                created_at=self._datetime(message["created_at"]),
-            )
-            for message in message_rows
-        )
         usage_rows = connection.execute(
-            """
-            SELECT payload
-            FROM chat_turn_usage
-            WHERE session_id = ?
-            ORDER BY turn
-            """,
+            "SELECT payload FROM chat_turn_usage WHERE session_id = ? ORDER BY turn",
             (session_id,),
         ).fetchall()
-        token_metrics = tuple(
-            AgentTokenMetrics(**json.loads(usage["payload"])) for usage in usage_rows
-        )
-        summary_row = connection.execute(
-            """
-            SELECT content, summarized_message_count, updated_at
-            FROM chat_context_summaries
-            WHERE session_id = ?
-            """,
+        facts_row = connection.execute(
+            "SELECT payload FROM chat_facts WHERE session_id = ?",
             (session_id,),
         ).fetchone()
-        context_summary = (
-            StoredContextSummary(
-                content=summary_row["content"],
-                summarized_message_count=summary_row["summarized_message_count"],
-                updated_at=self._datetime(summary_row["updated_at"]),
-            )
-            if summary_row is not None
-            else StoredContextSummary()
-        )
-        compaction_rows = connection.execute(
-            """
-            SELECT
-                id,
-                summary,
-                source_start_position,
-                source_end_position,
-                summarized_message_count,
-                created_at
-            FROM chat_context_compactions
-            WHERE session_id = ?
-            ORDER BY source_end_position
-            """,
+        checkpoint_rows = connection.execute(
+            """SELECT id, name, message_count, created_at FROM chat_checkpoints
+               WHERE session_id = ? ORDER BY created_at""",
             (session_id,),
         ).fetchall()
-        compactions = tuple(
-            StoredContextCompaction(
-                id=compaction["id"],
-                summary=compaction["summary"],
-                source_start_position=compaction["source_start_position"],
-                source_end_position=compaction["source_end_position"],
-                summarized_message_count=compaction["summarized_message_count"],
-                created_at=self._datetime(compaction["created_at"]),
-            )
-            for compaction in compaction_rows
-        )
         return StoredSession(
             id=row["id"],
             title=row["title"],
             created_at=self._datetime(row["created_at"]),
             updated_at=self._datetime(row["updated_at"]),
-            messages=messages,
-            token_metrics=token_metrics,
-            compactions=compactions,
-            context_summary=context_summary,
+            strategy=cast(ContextStrategyName, row["strategy"]),
+            window_size=row["window_size"],
+            parent_session_id=row["parent_session_id"],
+            checkpoint_id=row["checkpoint_id"],
+            branch_name=row["branch_name"],
+            messages=tuple(
+                StoredMessage(
+                    id=item["id"],
+                    position=item["position"],
+                    role=item["role"],
+                    content=item["content"],
+                    created_at=self._datetime(item["created_at"]),
+                )
+                for item in message_rows
+            ),
+            token_metrics=tuple(
+                AgentTokenMetrics(
+                    **{
+                        key: value
+                        for key, value in json.loads(item["payload"]).items()
+                        if key in {field.name for field in fields(AgentTokenMetrics)}
+                    }
+                )
+                for item in usage_rows
+            ),
+            facts=json.loads(facts_row["payload"]) if facts_row else {},
+            checkpoints=tuple(
+                StoredCheckpoint(
+                    id=item["id"],
+                    name=item["name"],
+                    message_count=item["message_count"],
+                    created_at=self._datetime(item["created_at"]),
+                )
+                for item in checkpoint_rows
+            ),
         )
 
-    def create(self) -> StoredSession:
+    def create(
+        self,
+        *,
+        strategy: ContextStrategyName = "sliding_window",
+        window_size: int = 6,
+    ) -> StoredSession:
         session_id = str(uuid4())
         now = datetime.now(timezone.utc)
         with self._connection() as connection:
             connection.execute(
-                """
-                INSERT INTO chat_sessions (id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (session_id, "Новый чат", self._timestamp(now), self._timestamp(now)),
+                """INSERT INTO chat_sessions (
+                    id, title, created_at, updated_at, strategy, window_size,
+                    parent_session_id, checkpoint_id, branch_name
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'main')""",
+                (
+                    session_id,
+                    "Новый чат",
+                    self._timestamp(now),
+                    self._timestamp(now),
+                    strategy,
+                    window_size,
+                ),
             )
-        return StoredSession(session_id, "Новый чат", now, now)
+        return self.get(session_id)
 
     def list(self) -> list[StoredSession]:
         with self._connection() as connection:
             rows = connection.execute(
-                """
-                SELECT id FROM chat_sessions
-                ORDER BY updated_at DESC
-                LIMIT 100
-                """,
+                "SELECT id FROM chat_sessions ORDER BY updated_at DESC LIMIT 100"
             ).fetchall()
             return [self._load_session(connection, row["id"]) for row in rows]
 
@@ -330,14 +309,28 @@ class SQLiteChatSessionRepository:
         with self._connection() as connection:
             connection.execute("DELETE FROM chat_sessions")
 
+    def update_strategy(
+        self,
+        session_id: str,
+        strategy: ContextStrategyName,
+        window_size: int,
+    ) -> StoredSession:
+        with self._connection() as connection:
+            updated = connection.execute(
+                "UPDATE chat_sessions SET strategy = ?, window_size = ? WHERE id = ?",
+                (strategy, window_size, session_id),
+            )
+            if updated.rowcount == 0:
+                raise ChatSessionNotFound(session_id)
+        return self.get(session_id)
+
     def append_exchange(
         self,
         session_id: str,
         user_content: str,
         assistant_content: str,
         token_metrics: AgentTokenMetrics,
-        context_summary: StoredContextSummary | None = None,
-        compactions: Sequence[StoredContextCompaction] = (),
+        facts: dict[str, str] | None = None,
     ) -> StoredSession:
         now = datetime.now(timezone.utc)
         timestamp = self._timestamp(now)
@@ -348,13 +341,10 @@ class SQLiteChatSessionRepository:
             title = session.title
             if not session.messages:
                 title = user_content.replace("\n", " ").strip()[:60] or "Новый чат"
-
             connection.executemany(
-                """
-                INSERT INTO chat_messages
-                    (id, session_id, position, role, content, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
+                """INSERT INTO chat_messages
+                   (id, session_id, position, role, content, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 [
                     (str(uuid4()), session_id, position, "user", user_content, timestamp),
                     (
@@ -364,86 +354,115 @@ class SQLiteChatSessionRepository:
                 ],
             )
             connection.execute(
-                """
-                INSERT INTO chat_turn_usage (session_id, turn, payload)
-                VALUES (?, ?, ?)
-                """,
+                "INSERT INTO chat_turn_usage (session_id, turn, payload) VALUES (?, ?, ?)",
                 (
                     session_id,
                     len(session.token_metrics) + 1,
                     json.dumps(asdict(token_metrics), ensure_ascii=False),
                 ),
             )
-            if context_summary is not None:
-                summary_updated_at = context_summary.updated_at or now
+            if facts is not None:
                 connection.execute(
-                    """
-                    INSERT INTO chat_context_summaries
-                        (session_id, content, summarized_message_count, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(session_id) DO UPDATE SET
-                        content = excluded.content,
-                        summarized_message_count = excluded.summarized_message_count,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        session_id,
-                        context_summary.content,
-                        context_summary.summarized_message_count,
-                        self._timestamp(summary_updated_at),
-                    ),
-                )
-            if compactions:
-                connection.executemany(
-                    """
-                    INSERT INTO chat_context_compactions (
-                        id,
-                        session_id,
-                        summary,
-                        source_start_position,
-                        source_end_position,
-                        summarized_message_count,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            compaction.id,
-                            session_id,
-                            compaction.summary,
-                            compaction.source_start_position,
-                            compaction.source_end_position,
-                            compaction.summarized_message_count,
-                            self._timestamp(compaction.created_at),
-                        )
-                        for compaction in compactions
-                    ],
+                    """INSERT INTO chat_facts (session_id, payload, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(session_id) DO UPDATE SET
+                         payload = excluded.payload, updated_at = excluded.updated_at""",
+                    (session_id, json.dumps(facts, ensure_ascii=False), timestamp),
                 )
             connection.execute(
                 "UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?",
                 (title, timestamp, session_id),
             )
-
         return self.get(session_id)
+
+    def create_checkpoint(self, session_id: str, name: str) -> StoredCheckpoint:
+        checkpoint_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        with self._connection() as connection:
+            session = self._load_session(connection, session_id)
+            if not session.messages:
+                raise ValueError("Нельзя создать checkpoint в пустом диалоге")
+            connection.execute(
+                """INSERT INTO chat_checkpoints
+                   (id, session_id, name, message_count, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    checkpoint_id,
+                    session_id,
+                    name.strip(),
+                    len(session.messages),
+                    self._timestamp(now),
+                ),
+            )
+        return StoredCheckpoint(checkpoint_id, name.strip(), len(session.messages), now)
+
+    def fork(self, session_id: str, checkpoint_id: str, name: str) -> StoredSession:
+        branch_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        timestamp = self._timestamp(now)
+        with self._connection() as connection:
+            source = self._load_session(connection, session_id)
+            checkpoint = connection.execute(
+                """SELECT id, message_count FROM chat_checkpoints
+                   WHERE id = ? AND session_id = ?""",
+                (checkpoint_id, session_id),
+            ).fetchone()
+            if checkpoint is None:
+                raise ChatCheckpointNotFound(checkpoint_id)
+            message_count = int(checkpoint["message_count"])
+            connection.execute(
+                """INSERT INTO chat_sessions (
+                    id, title, created_at, updated_at, strategy, window_size,
+                    parent_session_id, checkpoint_id, branch_name
+                ) VALUES (?, ?, ?, ?, 'branching', ?, ?, ?, ?)""",
+                (
+                    branch_id,
+                    f"{source.title} · {name.strip()}",
+                    timestamp,
+                    timestamp,
+                    source.window_size,
+                    session_id,
+                    checkpoint_id,
+                    name.strip(),
+                ),
+            )
+            for message in source.messages[:message_count]:
+                connection.execute(
+                    """INSERT INTO chat_messages
+                       (id, session_id, position, role, content, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid4()), branch_id, message.position, message.role,
+                        message.content, self._timestamp(message.created_at),
+                    ),
+                )
+            turn_count = message_count // 2
+            for turn, metrics in enumerate(source.token_metrics[:turn_count], start=1):
+                connection.execute(
+                    "INSERT INTO chat_turn_usage (session_id, turn, payload) VALUES (?, ?, ?)",
+                    (branch_id, turn, json.dumps(asdict(metrics), ensure_ascii=False)),
+                )
+            if source.facts:
+                connection.execute(
+                    "INSERT INTO chat_facts (session_id, payload, updated_at) VALUES (?, ?, ?)",
+                    (branch_id, json.dumps(source.facts, ensure_ascii=False), timestamp),
+                )
+        return self.get(branch_id)
 
 
 class ChatSessionService:
-    """Adapt persistent sessions to the storage-agnostic Agent."""
-
     def __init__(
         self,
         repository: ChatSessionRepository,
         agent: Agent,
         *,
-        summarizer: ConversationSummarizer | None = None,
+        facts_extractor: FactsExtractor | None = None,
         token_counter: TokenCounter | None = None,
-        summary_batch_messages: int = 10,
     ) -> None:
         self._repository = repository
         self._agent = agent
-        self._summarizer = summarizer
+        self._facts_extractor = facts_extractor
         self._token_counter = token_counter
-        self._summary_batch_messages = summary_batch_messages
 
     @staticmethod
     def _summary(session: StoredSession) -> ChatSessionSummary:
@@ -452,6 +471,11 @@ class ChatSessionService:
             title=session.title,
             created_at=session.created_at,
             updated_at=session.updated_at,
+            strategy=session.strategy,
+            window_size=session.window_size,
+            parent_session_id=session.parent_session_id,
+            checkpoint_id=session.checkpoint_id,
+            branch_name=session.branch_name,
         )
 
     @staticmethod
@@ -465,27 +489,12 @@ class ChatSessionService:
         )
 
     @staticmethod
-    def _compaction(compaction: StoredContextCompaction) -> ChatContextCompaction:
-        return ChatContextCompaction(
-            id=compaction.id,
-            summary=compaction.summary,
-            source_start_position=compaction.source_start_position,
-            source_end_position=compaction.source_end_position,
-            summarized_message_count=compaction.summarized_message_count,
-            created_at=compaction.created_at,
-        )
-
-    def _context_summary(self, session: StoredSession) -> ChatContextSummary:
-        summary = session.context_summary
-        return ChatContextSummary(
-            content=summary.content,
-            summarized_message_count=summary.summarized_message_count,
-            summary_tokens=(
-                self._token_counter.count_text(summary.content)
-                if self._token_counter and summary.content
-                else 0
-            ),
-            updated_at=summary.updated_at,
+    def _checkpoint(item: StoredCheckpoint) -> ChatCheckpoint:
+        return ChatCheckpoint(
+            id=item.id,
+            name=item.name,
+            message_count=item.message_count,
+            created_at=item.created_at,
         )
 
     @staticmethod
@@ -500,143 +509,115 @@ class ChatSessionService:
         ]
         return ChatSessionTokenUsage(
             turns=turns,
-            prompt_tokens=sum(turn.prompt_tokens for turn in turns),
-            completion_tokens=sum(turn.completion_tokens for turn in turns),
-            total_tokens=sum(
-                turn.total_tokens + turn.summary_total_tokens for turn in turns
-            ),
+            prompt_tokens=sum(item.prompt_tokens for item in turns),
+            completion_tokens=sum(item.completion_tokens for item in turns),
+            total_tokens=sum(item.total_tokens + item.memory_total_tokens for item in turns),
             estimated_cost_usd=sum(
-                (turn.estimated_cost_usd or 0.0)
-                + (turn.summary_estimated_cost_usd or 0.0)
-                for turn in turns
+                (item.estimated_cost_usd or 0.0)
+                + (item.memory_estimated_cost_usd or 0.0)
+                for item in turns
             ),
-            summary_prompt_tokens=sum(turn.summary_prompt_tokens for turn in turns),
-            summary_completion_tokens=sum(
-                turn.summary_completion_tokens for turn in turns
-            ),
-            summary_total_tokens=sum(turn.summary_total_tokens for turn in turns),
-            summary_estimated_cost_usd=sum(
-                turn.summary_estimated_cost_usd or 0.0 for turn in turns
+            memory_prompt_tokens=sum(item.memory_prompt_tokens for item in turns),
+            memory_completion_tokens=sum(item.memory_completion_tokens for item in turns),
+            memory_total_tokens=sum(item.memory_total_tokens for item in turns),
+            memory_estimated_cost_usd=sum(
+                item.memory_estimated_cost_usd or 0.0 for item in turns
             ),
         )
 
-    def create(self) -> ChatSession:
-        session = self._repository.create()
+    def _session(self, session: StoredSession) -> ChatSession:
         return ChatSession(
             **self._summary(session).model_dump(),
-            messages=[],
-            compactions=[],
-            context_summary=ChatContextSummary(),
-            token_usage=ChatSessionTokenUsage(),
+            messages=[self._message(item) for item in session.messages],
+            facts=session.facts or {},
+            checkpoints=[self._checkpoint(item) for item in session.checkpoints],
+            token_usage=self._token_usage(session),
+        )
+
+    def create(
+        self,
+        *,
+        strategy: ContextStrategyName = "sliding_window",
+        window_size: int = 6,
+    ) -> ChatSession:
+        return self._session(
+            self._repository.create(strategy=strategy, window_size=window_size)
         )
 
     def list(self) -> list[ChatSessionSummary]:
         return [self._summary(session) for session in self._repository.list()]
 
     def get(self, session_id: str) -> ChatSession:
-        session = self._repository.get(session_id)
-        return ChatSession(
-            **self._summary(session).model_dump(),
-            messages=[self._message(message) for message in session.messages],
-            compactions=[
-                self._compaction(compaction) for compaction in session.compactions
-            ],
-            context_summary=self._context_summary(session),
-            token_usage=self._token_usage(session),
-        )
+        return self._session(self._repository.get(session_id))
 
     def clear(self) -> None:
         self._repository.clear()
 
+    def update_strategy(
+        self,
+        session_id: str,
+        strategy: ContextStrategyName,
+        window_size: int,
+    ) -> ChatSession:
+        return self._session(
+            self._repository.update_strategy(session_id, strategy, window_size)
+        )
+
+    def create_checkpoint(self, session_id: str, name: str) -> ChatCheckpoint:
+        return self._checkpoint(self._repository.create_checkpoint(session_id, name))
+
+    def fork(self, session_id: str, checkpoint_id: str, name: str) -> ChatSession:
+        return self._session(self._repository.fork(session_id, checkpoint_id, name))
+
     def send(self, session_id: str, content: str) -> ChatSendResponse:
         session = self._repository.get(session_id)
-        context_summary = session.context_summary
-        summarized_count = min(
-            context_summary.summarized_message_count,
-            len(session.messages),
-        )
-        context: list[AgentMessage] = [
-            {"role": message.role, "content": message.content}
-            for message in session.messages[summarized_count:]
+        history: list[AgentMessage] = [
+            {"role": message.role, "content": message.content}  # type: ignore[typeddict-item]
+            for message in session.messages
         ]
+        facts = dict(session.facts or {})
+        facts_update = None
+        if session.strategy == "sticky_facts":
+            if self._facts_extractor is None:
+                raise RuntimeError("Извлечение facts не настроено")
+            facts_update = self._facts_extractor.update(facts, content.strip())
+            facts = facts_update.facts
+
+        prepared = strategy_for(session.strategy, session.window_size).prepare(
+            history,
+            facts,
+        )
+        history_tokens = (
+            sum(
+                self._token_counter.count_text(item["content"])
+                + MESSAGE_OVERHEAD_TOKENS
+                for item in history
+            )
+            if self._token_counter
+            else None
+        )
         result = self._agent.respond(
-            context,
+            prepared.messages,
             content,
-            context_summary=context_summary.content,
+            memory_block=prepared.memory_block,
+            total_history_tokens=history_tokens,
+            strategy_dropped_messages=prepared.dropped_messages,
         )
         metrics = result.metrics
-        summary_usage = None
-        summary_cost = 0.0
-        compacted = 0
-        compactions: list[StoredContextCompaction] = []
-        pending: list[AgentMessage] = [
-            *context,
-            {"role": "user", "content": content.strip()},
-            {"role": "assistant", "content": result.content},
-        ]
-        next_summary = context_summary.content
-        while len(pending) >= self._summary_batch_messages:
-            if self._summarizer is None or self._token_counter is None:
-                raise RuntimeError("Компрессия контекста не настроена")
-            summary_result: SummaryResult = self._summarizer.summarize(
-                next_summary,
-                pending[:self._summary_batch_messages],
-            )
-            next_summary = summary_result.content
-            summary_usage = (
-                summary_result.usage
-                if summary_usage is None
-                else summary_usage + summary_result.usage
-            )
-            summary_cost += summary_result.estimated_cost_usd or 0.0
-            del pending[:self._summary_batch_messages]
-            source_start_position = summarized_count
-            summarized_count += self._summary_batch_messages
-            compacted += self._summary_batch_messages
-            compactions.append(
-                StoredContextCompaction(
-                    id=str(uuid4()),
-                    summary=next_summary,
-                    source_start_position=source_start_position,
-                    source_end_position=summarized_count - 1,
-                    summarized_message_count=summarized_count,
-                    created_at=datetime.now(timezone.utc),
-                )
-            )
-        if compacted:
-            context_summary = StoredContextSummary(
-                content=next_summary,
-                summarized_message_count=summarized_count,
-                updated_at=datetime.now(timezone.utc),
-            )
-
-        if summary_usage is not None:
+        if facts_update is not None:
             metrics = replace(
                 metrics,
-                summary_prompt_tokens=summary_usage.prompt_tokens,
-                summary_completion_tokens=summary_usage.completion_tokens,
-                summary_total_tokens=summary_usage.total_tokens,
-                summary_tokens=self._token_counter.count_text(context_summary.content),
-                summary_estimated_cost_usd=summary_cost,
-                compressed_messages=summarized_count,
-            )
-        else:
-            metrics = replace(
-                metrics,
-                summary_tokens=(
-                    self._token_counter.count_text(context_summary.content)
-                    if context_summary.content
-                    else 0
-                ),
-                compressed_messages=summarized_count,
+                memory_prompt_tokens=facts_update.usage.prompt_tokens,
+                memory_completion_tokens=facts_update.usage.completion_tokens,
+                memory_total_tokens=facts_update.usage.total_tokens,
+                memory_estimated_cost_usd=facts_update.estimated_cost_usd,
             )
         updated = self._repository.append_exchange(
             session_id,
             content.strip(),
             result.content,
             metrics,
-            context_summary,
-            compactions,
+            facts if session.strategy == "sticky_facts" else None,
         )
         return ChatSendResponse(
             session=self._summary(updated),

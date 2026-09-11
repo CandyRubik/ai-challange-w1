@@ -18,7 +18,7 @@ from app.agents.agent import (
 )
 from app.main import app, get_chat_session_service
 from app.services.chat_sessions import ChatSessionService, SQLiteChatSessionRepository
-from app.services.context_compression import ConversationSummarizer
+from app.services.context_strategies import FactsExtractor, strategy_for
 from app.token_usage import ModelResult, ModelTokenUsage
 
 
@@ -86,6 +86,20 @@ def test_frontend_keeps_messages_scrollable_and_submits_on_enter() -> None:
     assert "min-height: 0; overflow-y: auto;" in styles
 
 
+def test_frontend_separates_strategies_into_tabs() -> None:
+    static_dir = Path(__file__).parents[1] / "static"
+    html = (static_dir / "index.html").read_text()
+    javascript = (static_dir / "app.js").read_text()
+
+    assert len(re.findall(r'class="strategy-tab(?: active)?"', html)) == 3
+    assert 'data-strategy="sliding_window"' in html
+    assert 'data-strategy="sticky_facts"' in html
+    assert 'data-strategy="branching"' in html
+    assert 'id="strategy-select"' not in html
+    assert "session.strategy === activeStrategy" in javascript
+    assert "openStrategy(tab.dataset.strategy)" in javascript
+
+
 def test_agent_counts_request_history_and_response() -> None:
     model = FakeLanguageModel(["  Готово  "])
     agent = make_agent(model)
@@ -103,27 +117,29 @@ def test_agent_counts_request_history_and_response() -> None:
     assert model.calls[0][0][-1] == {"role": "user", "content": "Продолжим?"}
 
 
-def test_agent_places_summary_before_unsummarized_tail() -> None:
-    model = FakeLanguageModel(["Готово"])
-    agent = make_agent(model)
-
-    result = agent.respond(
-        [{"role": "assistant", "content": "Свежий ответ"}],
-        "Продолжим?",
-        context_summary="Пользователя зовут Лена.",
-    )
-
-    assert model.calls[0][0] == [
-        {"role": "system", "content": Agent.default_system_prompt},
-        {
-            "role": "system",
-            "content": "Conversation summary (older messages):\nПользователя зовут Лена.",
-        },
-        {"role": "assistant", "content": "Свежий ответ"},
-        {"role": "user", "content": "Продолжим?"},
+def test_context_strategies_prepare_distinct_prompts() -> None:
+    history: list[AgentMessage] = [
+        {"role": "user", "content": "Цель: приложение Orbit"},
+        {"role": "assistant", "content": "Принято"},
+        {"role": "user", "content": "Офлайн обязательно"},
+        {"role": "assistant", "content": "Учту"},
     ]
-    assert result.metrics.summary_tokens > 0
-    assert result.metrics.retained_messages == 1
+
+    sliding = strategy_for("sliding_window", 2).prepare(history, {})
+    sticky = strategy_for("sticky_facts", 2).prepare(
+        history,
+        {"goal": "приложение Orbit"},
+    )
+    branching = strategy_for("branching", 2).prepare(history, {})
+
+    assert [item["content"] for item in sliding.messages] == [
+        "Офлайн обязательно", "Учту",
+    ]
+    assert sliding.dropped_messages == 2
+    assert '"goal": "приложение Orbit"' in sticky.memory_block
+    assert sticky.dropped_messages == 2
+    assert branching.messages == history
+    assert branching.dropped_messages == 0
 
 
 def test_agent_trims_old_context_by_token_budget() -> None:
@@ -224,137 +240,94 @@ def test_context_and_token_usage_survive_backend_restart(tmp_path: Path) -> None
     ]
 
 
-def test_ten_messages_are_compacted_without_hiding_the_dialogue(
+def test_sticky_facts_are_updated_before_every_answer_and_persisted(
     tmp_path: Path,
 ) -> None:
-    answers = [f"Ответ {index}" for index in range(5)] + [
-        "Сжатая память: секретный код 42",
-        "Код по-прежнему 42",
-    ]
-    model = FakeLanguageModel(answers)
+    model = FakeLanguageModel([
+        '{"goal":"Orbit","language":"русский"}',
+        "Цель принята",
+        '{"goal":"Orbit","language":"русский","mode":"офлайн"}',
+        "Режим принят",
+    ])
     counter = WordCounter()
     service = ChatSessionService(
         repository(tmp_path),
         make_agent(model),
-        summarizer=ConversationSummarizer(model, max_tokens=100),
+        facts_extractor=FactsExtractor(model),
         token_counter=counter,
-        summary_batch_messages=10,
     )
-    session = service.create()
-    for index in range(5):
-        service.send(session.id, f"Сообщение {index}")
+    session = service.create(strategy="sticky_facts", window_size=2)
 
+    service.send(session.id, "Цель Orbit, язык русский")
+    service.send(session.id, "Добавь офлайн-режим")
     loaded = service.get(session.id)
 
-    assert len(loaded.messages) == 10
-    assert [message.position for message in loaded.messages] == list(range(10))
-    assert loaded.messages[0].content == "Сообщение 0"
-    assert loaded.messages[-1].content == "Ответ 4"
-    assert len(loaded.compactions) == 1
-    assert loaded.compactions[0].summary == "Сжатая память: секретный код 42"
-    assert loaded.compactions[0].source_start_position == 0
-    assert loaded.compactions[0].source_end_position == 9
-    assert loaded.compactions[0].summarized_message_count == 10
-    assert loaded.context_summary.content == "Сжатая память: секретный код 42"
-    assert loaded.context_summary.summarized_message_count == 10
-    assert loaded.token_usage.summary_total_tokens > 0
-    assert loaded.token_usage.turns[-1].compressed_messages == 10
-    answer_call, summary_call = model.calls[-2:]
-    assert summary_call[0][0]["content"].startswith("You maintain durable memory")
-    assert "Сообщение 0" in summary_call[0][1]["content"]
-    assert answer_call[0][-1]["content"] == "Сообщение 4"
-
-    service.send(session.id, "Какой код?")
-    next_prompt = model.calls[-1][0]
-    assert next_prompt[1]["content"].startswith("Conversation summary")
-    assert next_prompt[-1]["content"] == "Какой код?"
+    assert loaded.facts == {
+        "goal": "Orbit", "language": "русский", "mode": "офлайн",
+    }
+    assert loaded.token_usage.memory_total_tokens > 0
+    assert len(model.calls) == 4
+    assert "Durable user facts" in model.calls[-1][0][1]["content"]
+    assert model.calls[-1][0][-1]["content"] == "Добавь офлайн-режим"
 
 
-def test_context_summary_survives_repository_restart(tmp_path: Path) -> None:
-    database_path = tmp_path / "summary.sqlite3"
-    model = FakeLanguageModel(["Ответ"] * 5 + ["Summary"])
-    counter = WordCounter()
+def test_checkpoint_creates_independent_branches(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = ChatSessionService(repo, make_agent(FakeLanguageModel(["База"])))
+    root = service.create(strategy="branching")
+    service.send(root.id, "Общая часть")
+    checkpoint = service.create_checkpoint(root.id, "Общее ТЗ")
+
+    branch_a = service.fork(root.id, checkpoint.id, "MVP")
+    branch_b = service.fork(root.id, checkpoint.id, "Pro")
+    service_a = ChatSessionService(repo, make_agent(FakeLanguageModel(["Только A"])))
+    service_b = ChatSessionService(repo, make_agent(FakeLanguageModel(["Только B"])))
+    service_a.send(branch_a.id, "Добавь календарь")
+    service_b.send(branch_b.id, "Добавь команды")
+
+    contents_a = [item.content for item in service_a.get(branch_a.id).messages]
+    contents_b = [item.content for item in service_b.get(branch_b.id).messages]
+    assert contents_a[:2] == contents_b[:2] == ["Общая часть", "База"]
+    assert "Добавь календарь" in contents_a and "Добавь календарь" not in contents_b
+    assert "Добавь команды" in contents_b and "Добавь команды" not in contents_a
+    assert service_a.get(branch_a.id).parent_session_id == root.id
+
+
+def test_strategy_checkpoint_and_branch_http_flow(tmp_path: Path) -> None:
     service = ChatSessionService(
-        SQLiteChatSessionRepository(database_path),
-        make_agent(model),
-        summarizer=ConversationSummarizer(model),
-        token_counter=counter,
-        summary_batch_messages=10,
+        repository(tmp_path),
+        make_agent(FakeLanguageModel(["Общая база"])),
     )
-    session = service.create()
-    for index in range(5):
-        service.send(session.id, f"Вопрос {index}")
-
-    restarted = SQLiteChatSessionRepository(database_path).get(session.id)
-
-    assert restarted.context_summary.content == "Summary"
-    assert restarted.context_summary.summarized_message_count == 10
-    assert len(restarted.messages) == 10
-    assert len(restarted.compactions) == 1
-    assert restarted.compactions[0].source_start_position == 0
-    assert restarted.compactions[0].source_end_position == 9
-
-
-def test_legacy_summary_is_migrated_to_a_positioned_compaction(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "legacy-summary.sqlite3"
-    repository_before_upgrade = SQLiteChatSessionRepository(database_path)
-    session = repository_before_upgrade.create()
-    now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO chat_context_summaries
-                (session_id, content, summarized_message_count, updated_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (session.id, "Legacy summary", 10, now),
+    root = service.create()
+    service.send(root.id, "Собираем общее ТЗ")
+    app.dependency_overrides[get_chat_session_service] = lambda: service
+    client = TestClient(app)
+    try:
+        switched = client.put(
+            f"/api/chat/sessions/{root.id}/strategy",
+            json={"strategy": "branching", "window_size": 4},
         )
-        connection.execute("DROP TABLE chat_context_compactions")
+        checkpoint = client.post(
+            f"/api/chat/sessions/{root.id}/checkpoints",
+            json={"name": "Общее место"},
+        )
+        branch = client.post(
+            f"/api/chat/sessions/{root.id}/branches",
+            json={"checkpoint_id": checkpoint.json()["id"], "name": "MVP"},
+        )
+    finally:
+        app.dependency_overrides.clear()
 
-    migrated = SQLiteChatSessionRepository(database_path).get(session.id)
-
-    assert len(migrated.compactions) == 1
-    assert migrated.compactions[0].summary == "Legacy summary"
-    assert migrated.compactions[0].source_start_position == 0
-    assert migrated.compactions[0].source_end_position == 9
-
-
-def test_next_ten_messages_are_merged_into_the_existing_summary(
-    tmp_path: Path,
-) -> None:
-    answers = [
-        "Ответ 0", "Ответ 1", "Ответ 2", "Ответ 3", "Ответ 4", "Summary 1",
-        "Ответ 5", "Ответ 6", "Ответ 7", "Ответ 8", "Ответ 9", "Summary 2",
+    assert switched.status_code == 200
+    assert switched.json()["strategy"] == "branching"
+    assert checkpoint.status_code == 201
+    assert checkpoint.json()["message_count"] == 2
+    assert branch.status_code == 201
+    assert branch.json()["branch_name"] == "MVP"
+    assert branch.json()["parent_session_id"] == root.id
+    assert [item["content"] for item in branch.json()["messages"]] == [
+        "Собираем общее ТЗ", "Общая база",
     ]
-    model = FakeLanguageModel(answers)
-    counter = WordCounter()
-    service = ChatSessionService(
-        repository(tmp_path),
-        make_agent(model),
-        summarizer=ConversationSummarizer(model),
-        token_counter=counter,
-        summary_batch_messages=10,
-    )
-    session = service.create()
-
-    for index in range(10):
-        service.send(session.id, f"Вопрос {index}")
-
-    loaded = service.get(session.id)
-    second_summary_prompt = model.calls[-1][0][1]["content"]
-    assert len(loaded.messages) == 20
-    assert [message.position for message in loaded.messages] == list(range(20))
-    assert len(loaded.compactions) == 2
-    assert [
-        (item.source_start_position, item.source_end_position)
-        for item in loaded.compactions
-    ] == [(0, 9), (10, 19)]
-    assert loaded.compactions[-1].summary == "Summary 2"
-    assert loaded.context_summary.summarized_message_count == 20
-    assert "Summary 1" in second_summary_prompt
-    assert "Вопрос 5" in second_summary_prompt
 
 
 def test_repository_adds_usage_table_to_existing_database(tmp_path: Path) -> None:
@@ -438,6 +411,22 @@ def test_chat_session_http_flow_returns_token_usage(tmp_path: Path) -> None:
     assert sent.json()["token_usage"]["current_message_tokens"] == 1
     assert loaded.json()["token_usage"]["turns"][0]["completion_tokens"] == 3
     assert sessions.json()[0]["title"] == "Привет"
+
+
+def test_http_creates_session_inside_selected_strategy_tab(tmp_path: Path) -> None:
+    service = ChatSessionService(repository(tmp_path), make_agent(FakeLanguageModel()))
+    app.dependency_overrides[get_chat_session_service] = lambda: service
+    try:
+        response = TestClient(app).post(
+            "/api/chat/sessions",
+            json={"strategy": "sticky_facts", "window_size": 4},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    assert response.json()["strategy"] == "sticky_facts"
+    assert response.json()["window_size"] == 4
 
 
 def test_chat_http_reports_structured_context_overflow(tmp_path: Path) -> None:

@@ -115,8 +115,8 @@ class PreparedAgentRequest:
     sent_history_tokens: int
     estimated_prompt_tokens: int
     dropped_messages: int
-    summary_tokens: int
     retained_messages: int
+    memory_tokens: int = 0
 
 
 class Agent:
@@ -161,31 +161,40 @@ class Agent:
         context: AgentContext,
         current_message: str,
         *,
-        context_summary: str = "",
+        memory_block: str = "",
+        total_history_tokens: int | None = None,
+        strategy_dropped_messages: int = 0,
     ) -> PreparedAgentRequest:
         conversation = self._input_policy.apply(context, current_message)
         current = conversation[-1]
         original_history = conversation[:-1]
         sent_history = list(original_history) if self._context_enabled else []
-        summary_message: AgentMessage | None = None
-        if self._context_enabled and context_summary.strip():
-            summary_message = {
+        memory_message: AgentMessage | None = None
+        if self._context_enabled and memory_block.strip():
+            memory_message = {
                 "role": "system",
-                "content": "Conversation summary (older messages):\n" + context_summary.strip(),
+                "content": (
+                    "Durable user facts (key-value memory, not a summary):\n"
+                    + memory_block.strip()
+                ),
             }
 
         def model_messages() -> list[AgentMessage]:
             return [
                 {"role": "system", "content": self._system_prompt},
-                *([summary_message] if summary_message else []),
+                *([memory_message] if memory_message else []),
                 *sent_history,
                 current,
             ]
 
         current_tokens = self._counter.count_text(current["content"])
-        history_tokens = self._history_tokens(original_history)
+        history_tokens = (
+            total_history_tokens
+            if total_history_tokens is not None
+            else self._history_tokens(original_history)
+        )
         estimated_prompt = self._counter.count_messages(model_messages())
-        dropped_messages = 0
+        dropped_messages = strategy_dropped_messages
         while (
             estimated_prompt + self._max_tokens > self._context_limit_tokens
             and self._overflow_strategy == "trim"
@@ -212,12 +221,12 @@ class Agent:
             sent_history_tokens=self._history_tokens(sent_history),
             estimated_prompt_tokens=estimated_prompt,
             dropped_messages=dropped_messages,
-            summary_tokens=(
-                self._counter.count_text(summary_message["content"])
-                if summary_message
+            retained_messages=len(sent_history),
+            memory_tokens=(
+                self._counter.count_text(memory_message["content"])
+                if memory_message
                 else 0
             ),
-            retained_messages=len(sent_history),
         )
 
     def complete(
@@ -247,8 +256,8 @@ class Agent:
                 finish_reason=model_result.finish_reason,
                 model=model_result.model,
                 estimated_cost_usd=estimate_cost_usd(usage, model_result.model),
-                summary_tokens=request.summary_tokens,
                 retained_messages=request.retained_messages,
+                memory_tokens=request.memory_tokens,
             ),
         )
 
@@ -257,12 +266,16 @@ class Agent:
         context: AgentContext,
         current_message: str,
         *,
-        context_summary: str = "",
+        memory_block: str = "",
+        total_history_tokens: int | None = None,
+        strategy_dropped_messages: int = 0,
     ) -> AgentResult:
         request = self.prepare(
             context,
             current_message,
-            context_summary=context_summary,
+            memory_block=memory_block,
+            total_history_tokens=total_history_tokens,
+            strategy_dropped_messages=strategy_dropped_messages,
         )
         model_result = self._model.generate(
             messages=request.messages,
