@@ -3,16 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Чат с автоматической компактизацией контекста" />
-    <title>Rubik Chat</title>
+    <meta name="description" content="Лаборатория стратегий управления контекстом" />
+    <title>Rubik Context Lab</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="shell">
       <aside class="sidebar">
-        <a class="brand" href="/"><span>◇</span> Rubik Chat</a>
-        <button id="new-session" class="primary" type="button">＋ Новый чат</button>
+        <a class="brand" href="/"><span>◇</span> Context Lab</a>
+        <button id="new-session" class="primary" type="button">＋ Новый диалог</button>
+        <p class="sidebar-label">ДИАЛОГИ И ВЕТКИ</p>
         <nav id="sessions" aria-label="Сессии чата"></nav>
         <button id="clear-database" class="danger" type="button">Очистить историю</button>
       </aside>
@@ -20,8 +21,8 @@
       <section class="workspace" aria-labelledby="chat-title">
         <header>
           <div>
-            <p class="eyebrow">ЧАТ С КОМПАКТИЗАЦИЕЙ КОНТЕКСТА</p>
-            <h1 id="chat-title">Новый чат</h1>
+            <p class="eyebrow">ДЕНЬ 10 · УПРАВЛЕНИЕ КОНТЕКСТОМ БЕЗ SUMMARY</p>
+            <h1 id="chat-title">Новый диалог</h1>
           </div>
           <div class="session-usage">
             <strong id="session-tokens">0 токенов</strong>
@@ -29,8 +30,50 @@
           </div>
         </header>
 
+        <nav class="strategy-tabs" aria-label="Стратегии управления контекстом">
+          <button class="strategy-tab active" data-strategy="sliding_window" type="button">
+            <span>01</span><strong>Sliding Window</strong><small>Последние N сообщений</small>
+          </button>
+          <button class="strategy-tab" data-strategy="sticky_facts" type="button">
+            <span>02</span><strong>Sticky Facts</strong><small>Facts + последние N</small>
+          </button>
+          <button class="strategy-tab" data-strategy="branching" type="button">
+            <span>03</span><strong>Branching</strong><small>Независимые ветки</small>
+          </button>
+        </nav>
+
+        <section class="strategy-bar" aria-label="Настройки активной стратегии">
+          <div>
+            <p id="strategy-name">Sliding Window</p>
+            <p id="strategy-hint">В модель уходят только последние N сообщений; ранние детали отбрасываются.</p>
+          </div>
+          <div id="window-controls" class="window-controls">
+            <label>Размер окна
+              <span><input id="window-size" type="number" min="1" max="100" value="6" /> сообщений</span>
+            </label>
+            <button id="apply-window" type="button">Сохранить N</button>
+          </div>
+        </section>
+
+        <section id="branch-tools" class="branch-tools" hidden>
+          <div>
+            <input id="checkpoint-name" value="Общее ТЗ" maxlength="80" aria-label="Название checkpoint" />
+            <button id="save-checkpoint" type="button">◆ Сохранить checkpoint</button>
+          </div>
+          <div>
+            <select id="checkpoint-select" aria-label="Checkpoint"></select>
+            <input id="branch-name" placeholder="Название ветки" maxlength="80" aria-label="Название ветки" />
+            <button id="create-branch" type="button">⑂ Создать ветку</button>
+          </div>
+        </section>
+
+        <section id="facts-panel" class="facts-panel" hidden>
+          <div><p class="eyebrow">STICKY FACTS · KEY–VALUE</p><span id="facts-count">0 фактов</span></div>
+          <dl id="facts-list"><dd>Память заполнится после сообщения пользователя.</dd></dl>
+        </section>
+
         <div id="messages" class="messages" aria-live="polite">
-          <div class="empty"><span>✦</span><h2>Начните диалог</h2><p>После каждых 10 сообщений контекст автоматически сжимается.</p></div>
+          <div class="empty"><span>✦</span><h2>Выберите стратегию</h2><p>Соберите длинное ТЗ и наблюдайте, какой контекст реально получает агент.</p></div>
         </div>
 
         <footer>

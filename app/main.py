@@ -21,19 +21,25 @@ from .providers.deepseek import (
     LlmRequestError,
 )
 from .schemas import (
+    ChatBranchCreate,
+    ChatCheckpoint,
+    ChatCheckpointCreate,
     ChatSettings,
     ChatSendRequest,
     ChatSendResponse,
     ChatSession,
+    ChatSessionCreate,
     ChatSessionSummary,
+    ChatStrategyUpdate,
 )
 from .services.chat_sessions import (
+    ChatCheckpointNotFound,
     ChatSessionNotFound,
     ChatSessionService,
     DEFAULT_CHAT_DB_PATH,
     SQLiteChatSessionRepository,
 )
-from .services.context_compression import ConversationSummarizer
+from .services.context_strategies import FactsExtractor
 from .tokenizer import DeepSeekTokenCounter, TokenizerSetupError
 
 
@@ -47,12 +53,12 @@ def _allowed_origins() -> list[str]:
     return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
 
 
-app = FastAPI(title="Rubik Chat API")
+app = FastAPI(title="Rubik Context Lab API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
     allow_credentials=False,
-    allow_methods=["DELETE", "GET", "POST"],
+    allow_methods=["DELETE", "GET", "POST", "PUT"],
     allow_headers=["Content-Type"],
 )
 
@@ -83,12 +89,11 @@ def get_chat_session_service() -> ChatSessionService:
     return ChatSessionService(
         get_chat_repository(),
         agent,
-        summarizer=ConversationSummarizer(
+        facts_extractor=FactsExtractor(
             model,
-            max_tokens=settings.summary_max_tokens,
+            max_tokens=settings.facts_max_tokens,
         ),
         token_counter=_token_counter,
-        summary_batch_messages=settings.summary_batch_messages,
     )
 
 
@@ -102,9 +107,14 @@ def health() -> dict[str, bool | str]:
 
 @app.post("/api/chat/sessions", response_model=ChatSession, status_code=201)
 def create_chat_session(
+    request: ChatSessionCreate | None = None,
     service: ChatSessionService = Depends(get_chat_session_service),
 ) -> ChatSession:
-    return service.create()
+    settings = request or ChatSessionCreate()
+    return service.create(
+        strategy=settings.strategy,
+        window_size=settings.window_size,
+    )
 
 
 @app.get("/api/chat/sessions", response_model=list[ChatSessionSummary])
@@ -131,6 +141,54 @@ def get_chat_session(
         return service.get(session_id)
     except ChatSessionNotFound:
         raise HTTPException(status_code=404, detail="Чат не найден") from None
+
+
+@app.put("/api/chat/sessions/{session_id}/strategy", response_model=ChatSession)
+def update_chat_strategy(
+    session_id: str,
+    request: ChatStrategyUpdate,
+    service: ChatSessionService = Depends(get_chat_session_service),
+) -> ChatSession:
+    try:
+        return service.update_strategy(session_id, request.strategy, request.window_size)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Чат не найден") from None
+
+
+@app.post(
+    "/api/chat/sessions/{session_id}/checkpoints",
+    response_model=ChatCheckpoint,
+    status_code=201,
+)
+def create_chat_checkpoint(
+    session_id: str,
+    request: ChatCheckpointCreate,
+    service: ChatSessionService = Depends(get_chat_session_service),
+) -> ChatCheckpoint:
+    try:
+        return service.create_checkpoint(session_id, request.name)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Чат не найден") from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@app.post(
+    "/api/chat/sessions/{session_id}/branches",
+    response_model=ChatSession,
+    status_code=201,
+)
+def create_chat_branch(
+    session_id: str,
+    request: ChatBranchCreate,
+    service: ChatSessionService = Depends(get_chat_session_service),
+) -> ChatSession:
+    try:
+        return service.fork(session_id, request.checkpoint_id, request.name)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Чат не найден") from None
+    except ChatCheckpointNotFound:
+        raise HTTPException(status_code=404, detail="Checkpoint не найден") from None
 
 
 @app.post(
