@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 import re
 import sqlite3
@@ -10,7 +9,6 @@ import sqlite3
 from fastapi.testclient import TestClient
 import pytest
 
-import app.main as main_module
 from app.agents.agent import (
     Agent,
     AgentContextOverflow,
@@ -19,10 +17,8 @@ from app.agents.agent import (
     AgentOutputError,
 )
 from app.main import app, get_chat_session_service
-from app.providers.deepseek import LlmRequestError, LlmStreamChunk
-from app.schemas import ChatExperimentSettings
 from app.services.chat_sessions import ChatSessionService, SQLiteChatSessionRepository
-from app.services.token_benchmark import TokenBenchmarkService, benchmark_plan
+from app.services.context_compression import ConversationSummarizer
 from app.token_usage import ModelResult, ModelTokenUsage
 
 
@@ -60,38 +56,6 @@ class FakeLanguageModel:
         )
 
 
-class FakeStreamingLanguageModel(FakeLanguageModel):
-    def generate_stream(
-        self,
-        *,
-        messages: Sequence[AgentMessage],
-        max_tokens: int = 2_000,
-    ):
-        self.calls.append((list(messages), max_tokens))
-        if not self.answers:
-            raise LlmRequestError(
-                "DeepSeek rejected oversized context",
-                status_code=400,
-                provider_code="invalid_request_error",
-                provider_message="Maximum context length is 512 tokens",
-            )
-        answer = self.answers.pop(0)
-        midpoint = max(1, len(answer) // 2)
-        yield LlmStreamChunk(
-            content=answer[:midpoint],
-            model="deepseek-v4-flash",
-        )
-        yield LlmStreamChunk(
-            content=answer[midpoint:],
-            finish_reason="stop",
-            usage=ModelTokenUsage(
-                prompt_tokens=WordCounter().count_messages(messages),
-                completion_tokens=WordCounter().count_text(answer),
-            ),
-            model="deepseek-v4-flash",
-        )
-
-
 def make_agent(model: FakeLanguageModel, **kwargs: object) -> Agent:
     return Agent(model, WordCounter(), **kwargs)
 
@@ -105,6 +69,21 @@ def test_frontend_uses_same_origin_api_by_default() -> None:
 
     assert 'window.API_BASE_URL || ""' in javascript
     assert "http://localhost:8000" not in javascript
+
+
+def test_frontend_keeps_messages_scrollable_and_submits_on_enter() -> None:
+    static_dir = Path(__file__).parents[1] / "static"
+    javascript = (static_dir / "app.js").read_text()
+    styles = (static_dir / "styles.css").read_text()
+
+    assert 'messageInput.addEventListener("keydown"' in javascript
+    assert 'event.key !== "Enter" || event.shiftKey || event.isComposing' in javascript
+    assert "messageForm.requestSubmit()" in javascript
+    assert "appendPendingExchange(content)" in javascript
+    assert 'pending.className = "message assistant pending"' in javascript
+    assert "@keyframes typing-pulse" in styles
+    assert "min-height: 0; overflow: hidden;" in styles
+    assert "min-height: 0; overflow-y: auto;" in styles
 
 
 def test_agent_counts_request_history_and_response() -> None:
@@ -122,6 +101,29 @@ def test_agent_counts_request_history_and_response() -> None:
     assert result.metrics.completion_tokens == 1
     assert model.calls[0][0][0]["role"] == "system"
     assert model.calls[0][0][-1] == {"role": "user", "content": "Продолжим?"}
+
+
+def test_agent_places_summary_before_unsummarized_tail() -> None:
+    model = FakeLanguageModel(["Готово"])
+    agent = make_agent(model)
+
+    result = agent.respond(
+        [{"role": "assistant", "content": "Свежий ответ"}],
+        "Продолжим?",
+        context_summary="Пользователя зовут Лена.",
+    )
+
+    assert model.calls[0][0] == [
+        {"role": "system", "content": Agent.default_system_prompt},
+        {
+            "role": "system",
+            "content": "Conversation summary (older messages):\nПользователя зовут Лена.",
+        },
+        {"role": "assistant", "content": "Свежий ответ"},
+        {"role": "user", "content": "Продолжим?"},
+    ]
+    assert result.metrics.summary_tokens > 0
+    assert result.metrics.retained_messages == 1
 
 
 def test_agent_trims_old_context_by_token_budget() -> None:
@@ -220,6 +222,139 @@ def test_context_and_token_usage_survive_backend_restart(tmp_path: Path) -> None
         "Как меня зовут?",
         "Тебя зовут Лена",
     ]
+
+
+def test_ten_messages_are_compacted_without_hiding_the_dialogue(
+    tmp_path: Path,
+) -> None:
+    answers = [f"Ответ {index}" for index in range(5)] + [
+        "Сжатая память: секретный код 42",
+        "Код по-прежнему 42",
+    ]
+    model = FakeLanguageModel(answers)
+    counter = WordCounter()
+    service = ChatSessionService(
+        repository(tmp_path),
+        make_agent(model),
+        summarizer=ConversationSummarizer(model, max_tokens=100),
+        token_counter=counter,
+        summary_batch_messages=10,
+    )
+    session = service.create()
+    for index in range(5):
+        service.send(session.id, f"Сообщение {index}")
+
+    loaded = service.get(session.id)
+
+    assert len(loaded.messages) == 10
+    assert [message.position for message in loaded.messages] == list(range(10))
+    assert loaded.messages[0].content == "Сообщение 0"
+    assert loaded.messages[-1].content == "Ответ 4"
+    assert len(loaded.compactions) == 1
+    assert loaded.compactions[0].summary == "Сжатая память: секретный код 42"
+    assert loaded.compactions[0].source_start_position == 0
+    assert loaded.compactions[0].source_end_position == 9
+    assert loaded.compactions[0].summarized_message_count == 10
+    assert loaded.context_summary.content == "Сжатая память: секретный код 42"
+    assert loaded.context_summary.summarized_message_count == 10
+    assert loaded.token_usage.summary_total_tokens > 0
+    assert loaded.token_usage.turns[-1].compressed_messages == 10
+    answer_call, summary_call = model.calls[-2:]
+    assert summary_call[0][0]["content"].startswith("You maintain durable memory")
+    assert "Сообщение 0" in summary_call[0][1]["content"]
+    assert answer_call[0][-1]["content"] == "Сообщение 4"
+
+    service.send(session.id, "Какой код?")
+    next_prompt = model.calls[-1][0]
+    assert next_prompt[1]["content"].startswith("Conversation summary")
+    assert next_prompt[-1]["content"] == "Какой код?"
+
+
+def test_context_summary_survives_repository_restart(tmp_path: Path) -> None:
+    database_path = tmp_path / "summary.sqlite3"
+    model = FakeLanguageModel(["Ответ"] * 5 + ["Summary"])
+    counter = WordCounter()
+    service = ChatSessionService(
+        SQLiteChatSessionRepository(database_path),
+        make_agent(model),
+        summarizer=ConversationSummarizer(model),
+        token_counter=counter,
+        summary_batch_messages=10,
+    )
+    session = service.create()
+    for index in range(5):
+        service.send(session.id, f"Вопрос {index}")
+
+    restarted = SQLiteChatSessionRepository(database_path).get(session.id)
+
+    assert restarted.context_summary.content == "Summary"
+    assert restarted.context_summary.summarized_message_count == 10
+    assert len(restarted.messages) == 10
+    assert len(restarted.compactions) == 1
+    assert restarted.compactions[0].source_start_position == 0
+    assert restarted.compactions[0].source_end_position == 9
+
+
+def test_legacy_summary_is_migrated_to_a_positioned_compaction(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-summary.sqlite3"
+    repository_before_upgrade = SQLiteChatSessionRepository(database_path)
+    session = repository_before_upgrade.create()
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO chat_context_summaries
+                (session_id, content, summarized_message_count, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (session.id, "Legacy summary", 10, now),
+        )
+        connection.execute("DROP TABLE chat_context_compactions")
+
+    migrated = SQLiteChatSessionRepository(database_path).get(session.id)
+
+    assert len(migrated.compactions) == 1
+    assert migrated.compactions[0].summary == "Legacy summary"
+    assert migrated.compactions[0].source_start_position == 0
+    assert migrated.compactions[0].source_end_position == 9
+
+
+def test_next_ten_messages_are_merged_into_the_existing_summary(
+    tmp_path: Path,
+) -> None:
+    answers = [
+        "Ответ 0", "Ответ 1", "Ответ 2", "Ответ 3", "Ответ 4", "Summary 1",
+        "Ответ 5", "Ответ 6", "Ответ 7", "Ответ 8", "Ответ 9", "Summary 2",
+    ]
+    model = FakeLanguageModel(answers)
+    counter = WordCounter()
+    service = ChatSessionService(
+        repository(tmp_path),
+        make_agent(model),
+        summarizer=ConversationSummarizer(model),
+        token_counter=counter,
+        summary_batch_messages=10,
+    )
+    session = service.create()
+
+    for index in range(10):
+        service.send(session.id, f"Вопрос {index}")
+
+    loaded = service.get(session.id)
+    second_summary_prompt = model.calls[-1][0][1]["content"]
+    assert len(loaded.messages) == 20
+    assert [message.position for message in loaded.messages] == list(range(20))
+    assert len(loaded.compactions) == 2
+    assert [
+        (item.source_start_position, item.source_end_position)
+        for item in loaded.compactions
+    ] == [(0, 9), (10, 19)]
+    assert loaded.compactions[-1].summary == "Summary 2"
+    assert loaded.context_summary.summarized_message_count == 20
+    assert "Summary 1" in second_summary_prompt
+    assert "Вопрос 5" in second_summary_prompt
 
 
 def test_repository_adds_usage_table_to_existing_database(tmp_path: Path) -> None:
@@ -332,85 +467,6 @@ def test_chat_http_reports_structured_context_overflow(tmp_path: Path) -> None:
     assert model.calls == []
 
 
-def test_benchmark_streams_requests_deltas_usage_and_overflow() -> None:
-    model = FakeStreamingLanguageModel(
-        ["Короткий ответ", "Ответ 1", "Ответ 2", "Ответ 3"]
-    )
-
-    events = list(
-        TokenBenchmarkService(
-            model,
-            WordCounter(),
-            system_prompt="system",
-            model_context_limit_tokens=512,
-            overflow_margin_tokens=10,
-        )
-        .stream_events()
-    )
-
-    event_types = [event["type"] for event in events]
-    assert event_types[0] == "benchmark_started"
-    assert event_types.count("turn_started") == 5
-    assert event_types.count("response_delta") == 8
-    assert event_types.count("turn_completed") == 4
-    assert event_types.count("overflow") == 1
-    assert event_types[-1] == "benchmark_completed"
-    report = events[-1]["report"]
-    assert report["scenarios"][1]["turns"][2]["response"] == "Ответ 3"
-    assert report["scenarios"][2]["status"] == "overflow"
-    assert report["api_calls_attempted"] == 5
-    assert report["api_calls_succeeded"] == 4
-    overflow = report["scenarios"][2]["overflow"]
-    assert overflow["request_sent_to_api"] is True
-    assert overflow["provider_status_code"] == 400
-    assert overflow["prompt_tokens"] > 512
-    assert len(model.calls) == 5
-
-
-def test_benchmark_plan_api_shows_prompts_before_paid_run() -> None:
-    response = TestClient(app).get("/api/benchmark/plan")
-
-    assert response.status_code == 200
-    assert response.json()["api_calls"] == 5
-    assert response.json()["scenarios"][0]["requests"][0].startswith(
-        "Коротко объясни"
-    )
-
-
-def test_benchmark_http_stream_finishes_and_saves_latest(monkeypatch) -> None:
-    model = FakeStreamingLanguageModel(
-        ["Короткий ответ", "Ответ 1", "Ответ 2", "Ответ 3"]
-    )
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    monkeypatch.setattr(main_module, "DeepSeekProvider", lambda **_: model)
-    monkeypatch.setattr(main_module, "_token_counter", WordCounter())
-    monkeypatch.setattr(main_module, "_latest_benchmark_report", None)
-    service_class = TokenBenchmarkService
-    monkeypatch.setattr(
-        main_module,
-        "TokenBenchmarkService",
-        lambda model, counter, *, system_prompt: service_class(
-            model,
-            counter,
-            system_prompt=system_prompt,
-            model_context_limit_tokens=512,
-            overflow_margin_tokens=10,
-        ),
-    )
-
-    client = TestClient(app)
-    response = client.post("/api/benchmark/run")
-    events = [json.loads(line) for line in response.text.splitlines()]
-    latest = client.get("/api/benchmark/latest")
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("application/x-ndjson")
-    assert events[-1]["type"] == "benchmark_completed"
-    assert latest.status_code == 200
-    assert latest.json()["api_calls_attempted"] == 5
-    assert latest.json()["scenarios"][1]["turns"][2]["response"] == "Ответ 3"
-
-
 def test_clear_chat_database_removes_all_sessions(tmp_path: Path) -> None:
     service = ChatSessionService(
         repository(tmp_path),
@@ -437,25 +493,3 @@ def test_unknown_chat_session_returns_404(tmp_path: Path) -> None:
     finally:
         app.dependency_overrides.clear()
     assert response.status_code == 404
-
-
-def test_debug_settings_can_change_context_policy() -> None:
-    changed = ChatExperimentSettings(
-        model="deepseek-v4-pro",
-        thinking_enabled=False,
-        history_enabled=False,
-        max_tokens=128,
-        context_limit_tokens=512,
-        overflow_strategy="trim",
-        system_prompt="Тестовый prompt",
-    )
-    client = TestClient(app)
-    try:
-        response = client.put("/api/debug/settings", json=changed.model_dump())
-        loaded = client.get("/api/debug/settings")
-    finally:
-        client.put("/api/debug/settings", json=ChatExperimentSettings().model_dump())
-
-    assert response.status_code == 200
-    assert loaded.json()["context_limit_tokens"] == 512
-    assert loaded.json()["overflow_strategy"] == "trim"

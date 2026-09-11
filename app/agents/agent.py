@@ -115,6 +115,8 @@ class PreparedAgentRequest:
     sent_history_tokens: int
     estimated_prompt_tokens: int
     dropped_messages: int
+    summary_tokens: int
+    retained_messages: int
 
 
 class Agent:
@@ -158,15 +160,24 @@ class Agent:
         self,
         context: AgentContext,
         current_message: str,
+        *,
+        context_summary: str = "",
     ) -> PreparedAgentRequest:
         conversation = self._input_policy.apply(context, current_message)
         current = conversation[-1]
         original_history = conversation[:-1]
         sent_history = list(original_history) if self._context_enabled else []
+        summary_message: AgentMessage | None = None
+        if self._context_enabled and context_summary.strip():
+            summary_message = {
+                "role": "system",
+                "content": "Conversation summary (older messages):\n" + context_summary.strip(),
+            }
 
         def model_messages() -> list[AgentMessage]:
             return [
                 {"role": "system", "content": self._system_prompt},
+                *([summary_message] if summary_message else []),
                 *sent_history,
                 current,
             ]
@@ -201,6 +212,12 @@ class Agent:
             sent_history_tokens=self._history_tokens(sent_history),
             estimated_prompt_tokens=estimated_prompt,
             dropped_messages=dropped_messages,
+            summary_tokens=(
+                self._counter.count_text(summary_message["content"])
+                if summary_message
+                else 0
+            ),
+            retained_messages=len(sent_history),
         )
 
     def complete(
@@ -230,6 +247,8 @@ class Agent:
                 finish_reason=model_result.finish_reason,
                 model=model_result.model,
                 estimated_cost_usd=estimate_cost_usd(usage, model_result.model),
+                summary_tokens=request.summary_tokens,
+                retained_messages=request.retained_messages,
             ),
         )
 
@@ -237,8 +256,14 @@ class Agent:
         self,
         context: AgentContext,
         current_message: str,
+        *,
+        context_summary: str = "",
     ) -> AgentResult:
-        request = self.prepare(context, current_message)
+        request = self.prepare(
+            context,
+            current_message,
+            context_summary=context_summary,
+        )
         model_result = self._model.generate(
             messages=request.messages,
             max_tokens=self._max_tokens,

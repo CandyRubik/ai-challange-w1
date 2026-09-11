@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
-import json
 import logging
 import os
 from pathlib import Path
-from threading import RLock
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .agents.agent import (
@@ -24,13 +21,11 @@ from .providers.deepseek import (
     LlmRequestError,
 )
 from .schemas import (
-    ChatExperimentSettings,
+    ChatSettings,
     ChatSendRequest,
     ChatSendResponse,
     ChatSession,
     ChatSessionSummary,
-    TokenBenchmarkPlan,
-    TokenBenchmarkReport,
 )
 from .services.chat_sessions import (
     ChatSessionNotFound,
@@ -38,8 +33,7 @@ from .services.chat_sessions import (
     DEFAULT_CHAT_DB_PATH,
     SQLiteChatSessionRepository,
 )
-from .services.experiment_settings import ExperimentSettingsStore
-from .services.token_benchmark import TokenBenchmarkService, benchmark_plan
+from .services.context_compression import ConversationSummarizer
 from .tokenizer import DeepSeekTokenCounter, TokenizerSetupError
 
 
@@ -53,19 +47,17 @@ def _allowed_origins() -> list[str]:
     return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
 
 
-app = FastAPI(title="Rubik Study Harness API")
+app = FastAPI(title="Rubik Chat API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
     allow_credentials=False,
-    allow_methods=["DELETE", "GET", "POST", "PUT"],
+    allow_methods=["DELETE", "GET", "POST"],
     allow_headers=["Content-Type"],
 )
 
-_experiment_settings = ExperimentSettingsStore()
+_chat_settings = ChatSettings()
 _token_counter = DeepSeekTokenCounter()
-_benchmark_lock = RLock()
-_latest_benchmark_report: TokenBenchmarkReport | None = None
 
 
 @lru_cache(maxsize=1)
@@ -75,20 +67,29 @@ def get_chat_repository() -> SQLiteChatSessionRepository:
 
 
 def get_chat_session_service() -> ChatSessionService:
-    settings = _experiment_settings.get()
+    settings = _chat_settings
+    model = DeepSeekProvider(
+        model=settings.model,
+        thinking_enabled=settings.thinking_enabled,
+    )
     agent = Agent(
-        DeepSeekProvider(
-            model=settings.model,
-            thinking_enabled=settings.thinking_enabled,
-        ),
+        model,
         _token_counter,
         system_prompt=settings.system_prompt,
         max_tokens=settings.max_tokens,
-        context_enabled=settings.history_enabled,
         context_limit_tokens=settings.context_limit_tokens,
         overflow_strategy=settings.overflow_strategy,
     )
-    return ChatSessionService(get_chat_repository(), agent)
+    return ChatSessionService(
+        get_chat_repository(),
+        agent,
+        summarizer=ConversationSummarizer(
+            model,
+            max_tokens=settings.summary_max_tokens,
+        ),
+        token_counter=_token_counter,
+        summary_batch_messages=settings.summary_batch_messages,
+    )
 
 
 @app.get("/api/health")
@@ -97,73 +98,6 @@ def health() -> dict[str, bool | str]:
         "status": "ok",
         "deepseek_configured": bool(os.getenv("DEEPSEEK_API_KEY")),
     }
-
-
-@app.get("/api/debug/settings", response_model=ChatExperimentSettings)
-def get_debug_settings() -> ChatExperimentSettings:
-    return _experiment_settings.get()
-
-
-@app.put("/api/debug/settings", response_model=ChatExperimentSettings)
-def update_debug_settings(settings: ChatExperimentSettings) -> ChatExperimentSettings:
-    return _experiment_settings.replace(settings)
-
-
-@app.get("/api/benchmark/plan", response_model=TokenBenchmarkPlan)
-def get_benchmark_plan() -> TokenBenchmarkPlan:
-    return benchmark_plan()
-
-
-@app.post("/api/benchmark/run")
-def run_benchmark() -> StreamingResponse:
-    if not os.getenv("DEEPSEEK_API_KEY"):
-        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан")
-
-    settings = _experiment_settings.get()
-    service = TokenBenchmarkService(
-        DeepSeekProvider(model=settings.model, thinking_enabled=False),
-        _token_counter,
-        system_prompt=settings.system_prompt,
-    )
-
-    def event_lines():
-        global _latest_benchmark_report
-        try:
-            with _benchmark_lock:
-                for event in service.stream_events():
-                    if event["type"] == "benchmark_completed":
-                        _latest_benchmark_report = TokenBenchmarkReport.model_validate_json(
-                            json.dumps(event["report"], ensure_ascii=False)
-                        )
-                    yield json.dumps(event, ensure_ascii=False) + "\n"
-        except (AgentInputError, AgentOutputError, TokenizerSetupError) as error:
-            yield json.dumps(
-                {"type": "error", "message": str(error)},
-                ensure_ascii=False,
-            ) + "\n"
-        except (LlmConfigurationError, LlmRequestError):
-            logger.exception("Token benchmark failed")
-            yield json.dumps(
-                {"type": "error", "message": "Benchmark завершился ошибкой"},
-                ensure_ascii=False,
-            ) + "\n"
-
-    return StreamingResponse(
-        event_lines(),
-        media_type="application/x-ndjson",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.get("/api/benchmark/latest", response_model=TokenBenchmarkReport)
-def get_latest_benchmark() -> TokenBenchmarkReport:
-    with _benchmark_lock:
-        if _latest_benchmark_report is None:
-            raise HTTPException(status_code=404, detail="Benchmark ещё не запускался")
-        return _latest_benchmark_report
 
 
 @app.post("/api/chat/sessions", response_model=ChatSession, status_code=201)
